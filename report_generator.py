@@ -615,6 +615,113 @@ class ReportGenerator:
         return filepath
 
 
+    def build_comparison_minutes(self, comp: BatchComparisonResult) -> str:
+        lines: List[str] = []
+        lines.append("=" * 70)
+        lines.append(f"  多品牌口碑对比纪要（客户版）")
+        lines.append("=" * 70)
+        lines.append("")
+        lines.append(f"生成时间: {comp.generated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"目标品牌: {comp.target_brand}")
+        lines.append(f"对比品牌: {', '.join(b for b in comp.brands if b != comp.target_brand)}")
+        lines.append(f"监测时段: {comp.time_range or '全量数据'}")
+        lines.append("")
+
+        sorted_rows = sorted(comp.rows, key=lambda r: (not r.is_target, -r.risk_score))
+
+        lines.append("-" * 70)
+        lines.append("【一、总体指标速览】")
+        lines.append("-" * 70)
+        header = f"  {'品牌':<10} {'类型':<6} {'讨论量':>6} {'环比':>8} {'负面占比':>8} {'风险分':>6}"
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for r in sorted_rows:
+            btype = "★目标" if r.is_target else "竞品"
+            arrow = f"{r.volume_change_rate:+.1f}%"
+            neg = f"{r.negative_ratio:.1f}%"
+            risk = f"{r.risk_score}/6"
+            lines.append(f"  {r.brand:<10} {btype:<6} {r.total_posts:>6} {arrow:>8} {neg:>8} {risk:>6}")
+        lines.append("")
+
+        lines.append("-" * 70)
+        lines.append("【二、各品牌详细情况与建议动作】")
+        lines.append("-" * 70)
+        for r in sorted_rows:
+            marker = "★ " if r.is_target else "  "
+            lines.append("")
+            lines.append(f"{marker}{r.brand}")
+            lines.append(f"  ├ 负面讨论占比: {r.negative_ratio:.1f}%（环比 {r.volume_change_rate:+.1f}%）")
+
+            if r.top_complaint:
+                lines.append(f"  ├ 主要槽点: 「{r.top_complaint}」{r.top_complaint_count} 次提及")
+            else:
+                lines.append(f"  ├ 主要槽点: 暂无明显集中槽点")
+
+            if r.top_advantage:
+                lines.append(f"  ├ 主要好评: 「{r.top_advantage}」{r.top_advantage_count} 次提及")
+
+            lines.append(f"  ├ 带节奏风险: {r.troll_ratio:.1f}% {'⚠ 偏高' if r.troll_ratio > 30 else '正常'}")
+            lines.append(f"  ├ 官方响应率: {r.official_response_ratio:.1f}% {'（建议加强）' if r.official_response_ratio < 15 and r.negative_ratio > 30 else ''}")
+
+            lines.append(f"  └ 建议动作:")
+            actions: List[str] = []
+            if r.is_target:
+                if r.negative_ratio > 50:
+                    actions.append("紧急召开舆情复盘会议，负面讨论已过半")
+                if r.volume_change_rate > 30:
+                    actions.append("追踪讨论量上升动因，确认是否有事件发酵")
+                if r.top_complaint and r.top_complaint_count >= max(3, r.total_posts * 0.2):
+                    actions.append(f"针对「{r.top_complaint}」准备危机话术与客户安抚方案")
+                if r.troll_ratio > 30:
+                    actions.append("舆情团队介入研判，排查竞品带节奏账号")
+                if r.official_response_ratio < 15 and r.negative_ratio > 30:
+                    actions.append("提升官方响应时效，避免负面进一步扩散")
+            else:
+                if r.top_advantage and r.top_advantage_count >= 3:
+                    actions.append(f"对标学习竞品「{r.top_advantage}」方面的用户口碑")
+                if r.official_response_ratio > 20:
+                    actions.append(f"参考竞品 {r.official_response_ratio:.0f}% 的官方响应机制")
+                if r.troll_ratio < 10:
+                    actions.append("研究竞品舆情治理经验，降低带节奏风险")
+            if not actions:
+                actions.append("维持常规观察，暂无特殊动作")
+            for act in actions:
+                lines.append(f"      · {act}")
+
+        lines.append("")
+        lines.append("-" * 70)
+        lines.append("【三、总结】")
+        lines.append("-" * 70)
+        target_row = next((r for r in comp.rows if r.is_target), None)
+        if target_row:
+            worst_comp = max((r for r in comp.rows if not r.is_target), key=lambda r: r.risk_score, default=None)
+            best_comp = min((r for r in comp.rows if not r.is_target), key=lambda r: r.risk_score, default=None)
+            lines.append(f"  · 目标品牌「{comp.target_brand}」风险等级: {target_row.risk_score}/6")
+            if worst_comp:
+                lines.append(f"  · 风险最高竞品: 「{worst_comp.brand}」({worst_comp.risk_score}/6)，可重点观察其负面应对")
+            if best_comp:
+                lines.append(f"  · 表现最佳竞品: 「{best_comp.brand}」({best_comp.risk_score}/6)，可对标学习其口碑运营")
+        lines.append("")
+        lines.append("=" * 70)
+        return "\n".join(lines)
+
+    def export_comparison_minutes(
+        self,
+        comp: BatchComparisonResult,
+        output_dir: Optional[str] = None,
+        filename_prefix: Optional[str] = None,
+    ) -> str:
+        odir = output_dir or self.config.get("output", {}).get("default_dir", "./reports")
+        os.makedirs(odir, exist_ok=True)
+        prefix = filename_prefix or f"对比纪要_{comp.target_brand}"
+        filename = f"{prefix}_{comp.generated_at.strftime('%Y%m%d_%H%M%S')}.txt"
+        filepath = os.path.join(odir, filename)
+        content = self.build_comparison_minutes(comp)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        return filepath
+
+
 def generate_report(result: AnalysisResult, config: Optional[Dict] = None):
     gen = ReportGenerator(config=config)
     gen.print_full_report(result)

@@ -306,10 +306,15 @@ class DataSourceSimulator:
         count: int = 200,
         library: Optional[SampleLibrary] = None,
         use_library: bool = True,
+        mode: str = "smart",
     ) -> Tuple[List[Post], Dict]:
         """
         生成/获取双周期数据：前一周期 + 当前周期，保证环比有意义。
-        优先从离线样本库中按品牌+时间范围读取，不足部分生成后入库。
+        优先从离线样本库中按品牌+时间范围读取，不足部分按 mode 处理：
+          - smart（默认）：复用库中已有数据，不足部分生成后入库，最多补齐到 count
+          - reuse：只复用库中已有数据，不新生成（保证结果可重现）
+          - resample：忽略已有数据，重新生成并覆盖（补采样）
+          - extend：扩展时间范围（如从7天扩到30天），保留旧数据并补充新区间
         """
         if params.time_range is None:
             end = datetime.now()
@@ -328,10 +333,26 @@ class DataSourceSimulator:
         brands_to_collect = [params.target_brand] + params.competing_brands
         sources_filter = params.data_sources or []
 
-        lib_stats = {"library_hit": 0, "new_generated": 0, "saved": 0}
+        lib_stats = {
+            "library_hit": 0,
+            "new_generated": 0,
+            "saved": 0,
+            "mode": mode,
+        }
         all_posts: List[Post] = []
 
-        if use_library:
+        def _stable_sort_and_trim(posts: List[Post], n: int) -> List[Post]:
+            posts_sorted = sorted(
+                posts,
+                key=lambda p: (
+                    p.publish_time.isoformat() if p.publish_time else "",
+                    p.post_id or "",
+                ),
+                reverse=True,
+            )
+            return posts_sorted[:n]
+
+        if use_library and mode != "resample":
             if library is None:
                 library = get_library()
             existing = library.fetch_by_brands_and_time(
@@ -348,42 +369,61 @@ class DataSourceSimulator:
             desired_count = int(count * target_share)
 
             existing_for_brand = [p for p in all_posts if p.brand == brand]
-            if len(existing_for_brand) >= desired_count:
+            if mode == "reuse":
+                all_posts = [p for p in all_posts if p.brand != brand]
+                all_posts.extend(_stable_sort_and_trim(existing_for_brand, desired_count))
                 continue
-            need_count = desired_count - len(existing_for_brand)
 
-            current_count_current = int(need_count * 0.55)
-            current_count_prev = need_count - current_count_current
+            if len(existing_for_brand) >= desired_count and mode == "smart":
+                all_posts = [p for p in all_posts if p.brand != brand]
+                all_posts.extend(_stable_sort_and_trim(existing_for_brand, desired_count))
+                continue
 
-            competing = params.competing_brands if brand == params.target_brand else []
+            need_count = max(0, desired_count - len(existing_for_brand))
+            if mode == "resample" or need_count > 0:
+                if mode == "resample":
+                    need_count = desired_count
 
-            new_current = self._generate_posts_for_range(
-                brand=brand,
-                time_range=time_range,
-                count=current_count_current,
-                focus_themes=params.focus_themes,
-                competing_brands=competing,
-                data_sources=sources_filter,
-            )
-            prev_tr = TimeRange(start_date=prev_start, end_date=prev_end)
-            new_prev = self._generate_posts_for_range(
-                brand=brand,
-                time_range=prev_tr,
-                count=current_count_prev,
-                focus_themes=params.focus_themes,
-                competing_brands=competing,
-                data_sources=sources_filter,
-            )
+                current_count_current = int(need_count * 0.55)
+                current_count_prev = need_count - current_count_current
 
-            new_posts = new_current + new_prev
-            all_posts.extend(new_posts)
-            lib_stats["new_generated"] += len(new_posts)
+                competing = params.competing_brands if brand == params.target_brand else []
 
-            if use_library and library is not None and new_posts:
-                saved = library.save_posts(new_posts)
-                lib_stats["saved"] += saved
+                new_current = self._generate_posts_for_range(
+                    brand=brand,
+                    time_range=time_range,
+                    count=current_count_current,
+                    focus_themes=params.focus_themes,
+                    competing_brands=competing,
+                    data_sources=sources_filter,
+                )
+                prev_tr = TimeRange(start_date=prev_start, end_date=prev_end)
+                new_prev = self._generate_posts_for_range(
+                    brand=brand,
+                    time_range=prev_tr,
+                    count=current_count_prev,
+                    focus_themes=params.focus_themes,
+                    competing_brands=competing,
+                    data_sources=sources_filter,
+                )
 
-        all_posts.sort(key=lambda p: p.publish_time or datetime.now(), reverse=True)
+                new_posts = new_current + new_prev
+                if mode == "resample":
+                    all_posts = [p for p in all_posts if p.brand != brand]
+                all_posts.extend(new_posts)
+                lib_stats["new_generated"] += len(new_posts)
+
+                if use_library and library is not None and new_posts:
+                    saved = library.save_posts(new_posts)
+                    lib_stats["saved"] += saved
+
+        all_posts.sort(
+            key=lambda p: (
+                p.publish_time.isoformat() if p.publish_time else "",
+                p.post_id or "",
+            ),
+            reverse=True,
+        )
         return all_posts, lib_stats
 
     def fetch_posts(self, params: QueryParams, count: int = 200) -> List[Post]:
@@ -402,6 +442,9 @@ def fetch_posts_with_library(
     seed: Optional[int] = None,
     use_library: bool = True,
     library: Optional[SampleLibrary] = None,
+    mode: str = "smart",
 ) -> Tuple[List[Post], Dict]:
     simulator = DataSourceSimulator(seed=seed)
-    return simulator.fetch_posts_with_library(params, count=count, use_library=use_library, library=library)
+    return simulator.fetch_posts_with_library(
+        params, count=count, use_library=use_library, library=library, mode=mode
+    )

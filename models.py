@@ -143,6 +143,8 @@ class AnalysisResult:
     theme_analysis: ThemeAnalysis = field(default_factory=ThemeAnalysis)
     representative_posts: List[Post] = field(default_factory=list)
     all_posts: List[Post] = field(default_factory=list)
+    current_range_posts: List[Post] = field(default_factory=list)
+    previous_range_posts: List[Post] = field(default_factory=list)
     generated_at: datetime = field(default_factory=datetime.now)
     complaint_details_cache: Dict[str, ComplaintDetail] = field(default_factory=dict)
 
@@ -206,3 +208,25 @@ class BatchComparisonResult:
     rows: List[BrandComparisonRow] = field(default_factory=list)
     generated_at: datetime = field(default_factory=datetime.now)
     brand_results: Dict[str, AnalysisResult] = field(default_factory=dict)
+
+
+@dataclass
+class FollowUpRecord:
+    query: str
+    matched_keyword: str
+    total_mentions: int
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass
+class ResearchProject:
+    project_id: str
+    name: str
+    query_params: QueryParams
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    latest_analysis_ref: str = ""
+    exported_minutes_paths: List[str] = field(default_factory=list)
+    exported_comparison_paths: List[str] = field(default_factory=list)
+    follow_up_history: List[FollowUpRecord] = field(default_factory=list)
+    notes: str = ""

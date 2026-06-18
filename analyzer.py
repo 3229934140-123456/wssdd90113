@@ -29,9 +29,26 @@ class Analyzer:
             generated_at=datetime.now(),
         )
 
+        if params.time_range is not None:
+            tr = params.time_range
+            range_days = max(1, (tr.end_date - tr.start_date).days)
+            prev_start = tr.start_date - timedelta(days=range_days)
+            prev_end = tr.start_date - timedelta(seconds=1)
+            result.current_range_posts = [
+                p for p in target_posts
+                if p.publish_time and tr.start_date <= p.publish_time <= tr.end_date
+            ]
+            result.previous_range_posts = [
+                p for p in target_posts
+                if p.publish_time and prev_start <= p.publish_time <= prev_end
+            ]
+        else:
+            result.current_range_posts = list(target_posts)
+            result.previous_range_posts = []
+
         result.volume_analysis = self._analyze_volume(target_posts, params)
-        result.theme_analysis = self._analyze_themes(target_posts, params)
-        result.representative_posts = self._select_representative_posts(target_posts, params)
+        result.theme_analysis = self._analyze_themes(result.current_range_posts, params)
+        result.representative_posts = self._select_representative_posts(result.current_range_posts, params)
 
         return result
 
@@ -344,7 +361,7 @@ class Analyzer:
 
         search_kw = matched_kw if matched_kw else keyword
 
-        posts = analysis_result.all_posts
+        posts = analysis_result.current_range_posts or analysis_result.all_posts
         matched_posts: List[Post] = []
         for p in posts:
             matched = False

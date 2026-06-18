@@ -21,12 +21,13 @@ from rich import print as rprint
 
 from models import (
     QueryParams, TimeRange, AnalysisResult, ComplaintDetail,
-    BatchComparisonResult
+    BatchComparisonResult, ResearchProject
 )
 from data_source import fetch_posts_with_library
 from analyzer import analyze, Analyzer
 from report_generator import ReportGenerator, generate_report
 from sample_library import get_library, SampleLibrary
+from project_manager import get_project_manager, ProjectManager
 
 
 console = Console()
@@ -156,27 +157,27 @@ def run_analysis(
     params: QueryParams,
     config: dict,
     use_library: bool = True,
+    library_mode: str = "smart",
 ) -> Tuple[AnalysisResult, dict]:
     library = get_library() if use_library else None
 
-    status_text = "[bold green]正在从样本库读取+补充生成数据...[/bold green]" if use_library else "[bold green]正在生成模拟数据...[/bold green]"
+    status_text = f"[bold green]数据获取模式: {library_mode}，正在处理...[/bold green]"
     with console.status(status_text) as status:
         posts, lib_stats = fetch_posts_with_library(
-            params, count=400, use_library=use_library, library=library
+            params, count=400, use_library=use_library, library=library, mode=library_mode
         )
         status.update("[bold green]数据准备完成，正在分析...[/bold green]")
         result = analyze(posts, params, config=config)
 
     if use_library:
-        hint_parts = []
+        hint_parts = [f"模式: {lib_stats.get('mode', library_mode)}"]
         if lib_stats.get("library_hit", 0) > 0:
             hint_parts.append(f"样本库命中 {lib_stats['library_hit']} 条")
         if lib_stats.get("new_generated", 0) > 0:
             hint_parts.append(f"新生成 {lib_stats['new_generated']} 条")
         if lib_stats.get("saved", 0) > 0:
             hint_parts.append(f"已入库 {lib_stats['saved']} 条")
-        if hint_parts:
-            console.print(f"  [dim]📚 {' | '.join(hint_parts)}[/dim]")
+        console.print(f"  [dim]📚 {' | '.join(hint_parts)}[/dim]")
 
     return result, lib_stats
 
@@ -185,12 +186,13 @@ def run_batch_comparison(
     params: QueryParams,
     config: dict,
     use_library: bool = True,
+    library_mode: str = "smart",
 ) -> BatchComparisonResult:
     library = get_library() if use_library else None
 
     with console.status("[bold green]正在准备多品牌对比数据...[/bold green]") as status:
         posts, lib_stats = fetch_posts_with_library(
-            params, count=500, use_library=use_library, library=library
+            params, count=500, use_library=use_library, library=library, mode=library_mode
         )
         status.update("[bold green]正在执行批量对比分析...[/bold green]")
         analyzer = Analyzer(config=config)
@@ -249,25 +251,97 @@ def clear_library_brand(brand: str):
         console.print(f"[green]✓ 已删除 {removed} 条「{brand}」相关数据。[/green]")
 
 
+def print_project_list(pm: ProjectManager):
+    projects = pm.list_projects()
+    if not projects:
+        console.print("[dim]还没有任何调研项目，使用「新建项目 <项目名>」创建第一个项目。[/dim]")
+        return
+
+    console.print(f"\n[bold cyan]📁 调研项目列表（共 {len(projects)} 个）:[/bold cyan]")
+    table = Table(box=box.MINIMAL, show_lines=False)
+    table.add_column("ID", style="bold dim", width=14)
+    table.add_column("项目名", style="bold")
+    table.add_column("目标品牌", style="cyan")
+    table.add_column("最后更新", justify="right")
+    table.add_column("追问次数", justify="right")
+    table.add_column("导出次数", justify="right")
+
+    for p in projects:
+        export_count = len(p.exported_minutes_paths) + len(p.exported_comparison_paths)
+        table.add_row(
+            p.project_id,
+            p.name,
+            p.query_params.target_brand,
+            p.updated_at.strftime("%m-%d %H:%M"),
+            str(len(p.follow_up_history)),
+            str(export_count),
+        )
+    console.print(table)
+
+
+def print_project_detail(project: ResearchProject):
+    console.print(Panel(
+        f"[bold]项目名:[/bold] {project.name}\n"
+        f"[bold]ID:[/bold] {project.project_id}\n"
+        f"[bold]目标品牌:[/bold] {project.query_params.target_brand}\n"
+        f"[bold]竞品:[/bold] {', '.join(project.query_params.competing_brands) or '-'}\n"
+        f"[bold]时间范围:[/bold] {project.query_params.time_range or '-'}\n"
+        f"[bold]关注主题:[/bold] {', '.join(project.query_params.focus_themes) or '-'}\n"
+        f"[bold]创建时间:[/bold] {project.created_at.strftime('%Y-%m-%d %H:%M')}\n"
+        f"[bold]最近更新:[/bold] {project.updated_at.strftime('%Y-%m-%d %H:%M')}\n"
+        f"[bold]追问历史:[/bold] {len(project.follow_up_history)} 条\n"
+        f"[bold]导出纪要:[/bold] {len(project.exported_minutes_paths)} 份\n"
+        f"[bold]导出对比:[/bold] {len(project.exported_comparison_paths)} 份",
+        title="[bold cyan]项目详情[/bold cyan]",
+        border_style="cyan",
+        expand=False,
+    ))
+    if project.follow_up_history:
+        console.print(f"\n[bold]最近追问:[/bold]")
+        for f in project.follow_up_history[-5:]:
+            console.print(f"  • 「{f.query}」→ {f.matched_keyword}（{f.total_mentions}次） {f.created_at.strftime('%m-%d %H:%M')}")
+    if project.exported_minutes_paths:
+        console.print(f"\n[bold]最近导出会议纪要:[/bold]")
+        for p in project.exported_minutes_paths[-3:]:
+            console.print(f"  • {p}")
+    if project.exported_comparison_paths:
+        console.print(f"\n[bold]最近导出对比纪要:[/bold]")
+        for p in project.exported_comparison_paths[-3:]:
+            console.print(f"  • {p}")
+
+
 def interactive_session(
     result: AnalysisResult,
     config: dict,
     params: QueryParams,
+    project: Optional[ResearchProject] = None,
+    library_mode: str = "smart",
 ):
     report_gen = ReportGenerator(config=config)
     analyzer_engine = Analyzer(config=config)
+    pm = get_project_manager()
+    use_library = library_mode != "off"
 
     console.print()
+    project_note = f" [bold cyan](当前项目: {project.name})[/bold cyan]" if project else ""
+    mode_note = f" [dim]样本模式: {library_mode}[/dim]"
     console.print(Panel(
         "[bold]命令提示:[/bold]\n"
         "  [cyan]追问 <任意描述>[/cyan]   深挖槽点（支持模糊，如「追问售后为什么差」「追问涨价」）\n"
         "  [cyan]列表[/cyan]                    查看所有关键词\n"
         "  [cyan]对比[/cyan]                    输出多品牌批量对比摘要\n"
+        "  [cyan]导出对比|导出对比纪要[/cyan]  保存客户版对比纪要（适合会前分发）\n"
         "  [cyan]导出[/cyan]                    保存为会议纪要格式\n"
         "  [cyan]样本库|库[/cyan]              查看离线样本库状态\n"
+        "  [cyan]模式 <smart|reuse|resample>[/cyan]  切换样本策略\n"
         "  [cyan]清空 <品牌>[/cyan]           清空某品牌的样本库数据\n"
+        "  [cyan]项目|projects[/cyan]         列出所有调研项目\n"
+        "  [cyan]新建项目 <名>[/cyan]         基于当前查询创建新项目\n"
+        "  [cyan]打开项目 <ID>[/cyan]         打开已有项目续查\n"
+        "  [cyan]项目详情[/cyan]              查看当前项目详细信息\n"
         "  [cyan]新查询[/cyan]                  开始新一轮调研\n"
-        "  [cyan]退出[/cyan]                    退出程序",
+        "  [cyan]退出[/cyan]                    退出程序"
+        + project_note + mode_note,
         border_style="yellow",
         expand=False,
     ))
@@ -293,13 +367,14 @@ def interactive_session(
 
         elif cmd_lower in ["列表", "list", "l", "ls"]:
             ta = result.theme_analysis
-            console.print("\n[bold cyan]=== 所有关键词 ===[/bold cyan]")
+            console.print("\n[bold cyan]=== 所有关键词（仅当前周期） ===[/bold cyan]")
             if ta.advantages:
                 console.print("[green]优点:[/green] " + ", ".join(f"{k.keyword}({k.count})" for k in ta.advantages[:10]))
             if ta.complaints:
                 console.print("[red]槽点:[/red] " + ", ".join(f"{k.keyword}({k.count})" for k in ta.complaints[:10]))
             if ta.questions:
                 console.print("[cyan]疑问:[/cyan] " + ", ".join(f"{k.keyword}({k.count})" for k in ta.questions[:10]))
+            console.print(f"[dim]（仅当前周期 {len(result.current_range_posts)} 条参与分析，上一周期 {len(result.previous_range_posts)} 条仅用于环比）[/dim]")
 
         elif cmd_lower.startswith("追问") or cmd_lower.startswith("dive") or cmd_lower.startswith("detail"):
             keyword = ""
@@ -318,6 +393,14 @@ def interactive_session(
             detail = analyzer_engine.get_complaint_detail(keyword, result)
             report_gen.print_complaint_detail(detail, keyword)
 
+            if project:
+                pm.add_follow_up(
+                    project,
+                    query=keyword,
+                    matched_keyword=detail.matched_keyword or keyword,
+                    total_mentions=detail.total_mentions,
+                )
+
         elif cmd_lower in ["导出", "export", "save", "s"]:
             default_dir = config.get("output", {}).get("default_dir", "./reports")
             output_dir = Prompt.ask("保存目录", default=default_dir)
@@ -325,6 +408,8 @@ def interactive_session(
                 minutes = report_gen.build_meeting_minutes(result)
                 filepath = report_gen.export_meeting_minutes(minutes, output_dir=output_dir)
             console.print(f"\n[bold green]✓ 会议纪要已保存:[/bold green] [underline]{os.path.abspath(filepath)}[/underline]")
+            if project:
+                pm.add_exported_minutes(project, os.path.abspath(filepath))
 
             if Confirm.ask("是否打开文件所在目录？", default=False):
                 abs_dir = os.path.abspath(os.path.dirname(filepath))
@@ -338,16 +423,57 @@ def interactive_session(
                 except Exception as e:
                     console.print(f"[yellow]无法打开目录: {e}[/yellow]")
 
+        elif cmd_lower.startswith("导出对比") or cmd_lower.startswith("对比导出") or cmd_lower in ["exportcmp", "exportcompare"]:
+            if not params.competing_brands:
+                console.print("[yellow]当前没有设置竞品，无法导出对比纪要。[/yellow]")
+                continue
+            default_dir = config.get("output", {}).get("default_dir", "./reports")
+            output_dir = Prompt.ask("保存目录", default=default_dir)
+            with console.status("[bold green]正在生成并导出对比纪要...[/bold green]"):
+                comp_result = run_batch_comparison(params, config, use_library=use_library, library_mode=library_mode)
+                filepath = report_gen.export_comparison_minutes(comp_result, output_dir=output_dir)
+            console.print(f"\n[bold green]✓ 客户版对比纪要已保存:[/bold green] [underline]{os.path.abspath(filepath)}[/underline]")
+            if project:
+                pm.add_exported_comparison(project, os.path.abspath(filepath))
+
         elif cmd_lower in ["对比", "compare", "cmp", "c"]:
             if not params.competing_brands:
                 console.print("[yellow]当前没有设置竞品，请先使用「新查询」增加竞品。[/yellow]")
                 continue
             with console.status("[bold green]正在生成批量对比...[/bold green]"):
-                comp_result = run_batch_comparison(params, config)
+                comp_result = run_batch_comparison(params, config, use_library=use_library, library_mode=library_mode)
             report_gen.print_batch_comparison(comp_result)
+            if Confirm.ask("是否导出为客户版对比纪要？", default=True):
+                default_dir = config.get("output", {}).get("default_dir", "./reports")
+                output_dir = Prompt.ask("保存目录", default=default_dir)
+                filepath = report_gen.export_comparison_minutes(comp_result, output_dir=output_dir)
+                console.print(f"  [bold green]✓ 已保存:[/bold green] [underline]{os.path.abspath(filepath)}[/underline]")
+                if project:
+                    pm.add_exported_comparison(project, os.path.abspath(filepath))
 
         elif cmd_lower in ["样本库", "库", "library", "lib", "db"]:
             print_library_status()
+
+        elif cmd_lower.startswith("模式") or cmd_lower.startswith("mode"):
+            mode_val = ""
+            for sep in ["模式", "mode"]:
+                idx = cmd_lower.find(sep)
+                if idx >= 0:
+                    mode_val = cmd[idx + len(sep):].strip().lower()
+                    break
+            if not mode_val:
+                mode_val = Prompt.ask("选择样本策略", choices=["smart", "reuse", "resample"], default=library_mode)
+            if mode_val not in ["smart", "reuse", "resample"]:
+                console.print(f"[yellow]无效模式: {mode_val}，可选 smart/reuse/resample[/yellow]")
+                continue
+            library_mode = mode_val
+            console.print(f"[green]✓ 已切换为「{library_mode}」模式:[/green]")
+            mode_desc = {
+                "smart": "复用库中数据，不足时自动生成新样本并入库（默认）",
+                "reuse": "仅复用库中已有数据，不生成新样本（保证结果完全可重现）",
+                "resample": "忽略已有数据，重新生成新样本并追加入库（补采样）",
+            }
+            console.print(f"  {mode_desc[library_mode]}")
 
         elif cmd_lower.startswith("清空") or cmd_lower.startswith("clear"):
             brand_to_clear = ""
@@ -360,6 +486,50 @@ def interactive_session(
                 brand_to_clear = Prompt.ask("请输入要清空的品牌名", default=params.target_brand)
             clear_library_brand(brand_to_clear)
 
+        elif cmd_lower in ["项目", "projects", "proj"]:
+            print_project_list(pm)
+
+        elif cmd_lower.startswith("新建项目") or cmd_lower.startswith("newproject"):
+            project_name = ""
+            for sep in ["新建项目", "newproject"]:
+                idx = cmd_lower.find(sep)
+                if idx >= 0:
+                    project_name = cmd[idx + len(sep):].strip()
+                    break
+            if not project_name:
+                default_name = f"{params.target_brand}_调研_{datetime.now().strftime('%m%d')}"
+                project_name = Prompt.ask("项目名", default=default_name)
+            project = pm.create_project(name=project_name, params=params)
+            console.print(f"[bold green]✓ 项目已创建:[/bold green] {project.name} (ID: {project.project_id})")
+            print_project_detail(project)
+
+        elif cmd_lower.startswith("打开项目") or cmd_lower.startswith("openproject"):
+            project_id = ""
+            for sep in ["打开项目", "openproject"]:
+                idx = cmd_lower.find(sep)
+                if idx >= 0:
+                    project_id = cmd[idx + len(sep):].strip()
+                    break
+            if not project_id:
+                print_project_list(pm)
+                project_id = Prompt.ask("请输入项目ID")
+            project = pm.load_project(project_id)
+            if not project:
+                console.print(f"[red]项目不存在: {project_id}[/red]")
+                continue
+            print_project_detail(project)
+            if Confirm.ask(f"是否加载项目「{project.name}」并基于其参数重新分析？", default=True):
+                params = project.query_params
+                with console.status("[bold green]正在基于项目参数重新分析...[/bold green]"):
+                    result, _ = run_analysis(params, config, use_library=use_library, library_mode="reuse")
+                report_gen.print_full_report(result)
+
+        elif cmd_lower in ["项目详情", "projectinfo"]:
+            if not project:
+                console.print("[yellow]当前没有关联项目，使用「新建项目」创建或「打开项目」加载。[/yellow]")
+            else:
+                print_project_detail(project)
+
         elif cmd_lower in ["新查询", "new", "reset", "n"]:
             if Confirm.ask("确定要开始新一轮查询吗？", default=True):
                 return True
@@ -367,16 +537,22 @@ def interactive_session(
         elif cmd_lower in ["帮助", "help", "h", "?"]:
             console.print(Panel(
                 "[bold]可用命令:[/bold]\n"
-                "  [cyan]追问 <描述>[/cyan]   模糊匹配后深挖槽点（如「追问售后差」「涨价」「新品翻车」）\n"
-                "  [cyan]列表[/cyan]            列出所有优点/槽点/疑问关键词\n"
-                "  [cyan]重绘[/cyan]            重新显示完整三段式报告\n"
-                "  [cyan]对比[/cyan]            目标品牌 vs 多竞品批量对照摘要\n"
-                "  [cyan]导出[/cyan]            保存会议纪要 TXT\n"
-                "  [cyan]样本库[/cyan]          查看离线样本库累计数据量\n"
-                "  [cyan]清空 <品牌>[/cyan]    清除某品牌的样本库数据\n"
-                "  [cyan]新查询[/cyan]          开始新一轮调研\n"
-                "  [cyan]帮助[/cyan]            显示本帮助\n"
-                "  [cyan]退出[/cyan]            退出程序",
+                "  [cyan]追问 <描述>[/cyan]      模糊匹配后深挖槽点（如「追问售后为什么差」「涨价」）\n"
+                "  [cyan]列表[/cyan]               列出所有优点/槽点/疑问关键词（仅当前周期）\n"
+                "  [cyan]重绘[/cyan]               重新显示完整三段式报告\n"
+                "  [cyan]对比[/cyan]               目标品牌 vs 多竞品批量对照摘要\n"
+                "  [cyan]导出[/cyan]               保存会议纪要 TXT\n"
+                "  [cyan]导出对比[/cyan]           保存客户版对比纪要（会前分发用）\n"
+                "  [cyan]模式 <策略>[/cyan]       smart/reuse/resample 样本策略切换\n"
+                "  [cyan]样本库[/cyan]             查看离线样本库累计数据量\n"
+                "  [cyan]清空 <品牌>[/cyan]       清除某品牌的样本库数据\n"
+                "  [cyan]项目[/cyan]               列出所有调研项目\n"
+                "  [cyan]新建项目 <名>[/cyan]    创建新项目，绑定当前查询\n"
+                "  [cyan]打开项目 <ID>[/cyan]    加载已有项目并复用其参数\n"
+                "  [cyan]项目详情[/cyan]           查看当前项目详情\n"
+                "  [cyan]新查询[/cyan]             开始新一轮调研\n"
+                "  [cyan]帮助[/cyan]               显示本帮助\n"
+                "  [cyan]退出[/cyan]               退出程序",
                 border_style="blue",
                 title="帮助",
                 expand=False,
@@ -389,18 +565,18 @@ def interactive_session(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reputation_checker",
-        description="品牌口碑速查工具 v2 - 面向品牌咨询顾问的论坛声音速查",
+        description="品牌口碑速查工具 v3 - 面向品牌咨询顾问的论坛声音速查",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-v2 更新内容:
-  · 讨论量环比含上一周期可比数据（不再固定+100%）
-  · 离线样本库：SQLite 持久化，重启仍可复用历史帖子
-  · 追问支持模糊匹配：「追问售后为什么差」自动定位到对应槽点
-  · 新增批量对比模式：--compare 输出多品牌对照摘要
+v3 更新内容:
+  · 口径纯净：优点/槽点/疑问/代表帖/追问 仅基于当前时间周期，上一周期仅用于环比
+  · 样本稳定：支持 smart/reuse/resample 三种样本策略，同查询结果可重现
+  · 项目管理：创建/打开调研项目，追问记录与导出纪要统一归档
+  · 客户版对比纪要：按品牌结构化导出（负面占比/槽点/带节奏/官方响应/建议动作）
 
 示例:
   python main.py --brand 小米手机 --competitors 华为手机,苹果手机 --days 30 --themes 售后,新品,涨价
-  python main.py --brand 小米手机 --competitors 华为手机,苹果手机 --days 30 --compare
+  python main.py --brand 小米手机 --competitors 华为手机,苹果手机 --days 30 --compare --export-compare
   python main.py  (进入交互模式)
         """,
     )
@@ -413,6 +589,9 @@ v2 更新内容:
     parser.add_argument("--config", type=str, default="config.yaml", help="配置文件路径")
     parser.add_argument("--compare", action="store_true", help="输出多品牌批量对比报告")
     parser.add_argument("--export", type=str, nargs="?", const="./reports", help="直接导出为会议纪要，可指定输出目录")
+    parser.add_argument("--export-compare", type=str, nargs="?", const="./reports", help="直接导出客户版对比纪要")
+    parser.add_argument("--project", type=str, help="绑定项目名，自动创建或打开同名项目")
+    parser.add_argument("--library-mode", type=str, default="smart", choices=["smart", "reuse", "resample"], help="样本库策略 smart/reuse/resample")
     parser.add_argument("--no-library", action="store_true", help="不使用离线样本库（仅临时生成）")
     parser.add_argument("--no-interactive", action="store_true", help="非交互模式，输出报告后直接退出")
     return parser
@@ -423,7 +602,7 @@ def show_banner():
 [bold magenta]░█▀█░█▀▀░█▀█░█░█░▀█▀░█▀█░▀█▀░░░░░█▀▀░█░█░█▀▀░█▀▀░█░█░█▀▀░█▀▄[/bold magenta]
 [bold magenta]░█▀▀░█▀▀░█░█░█░█░░█░░█░█░░█░░░░░░█░░█▀█░█▀▀░█░░░█▀▄░█▀▀░█▀▄[/bold magenta]
 [bold magenta]░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░▀░▀░░▀░░▀▀▀░░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀░▀░▀▀▀░▀░▀[/bold magenta]
-[dim]Reputation Quick Check Tool v2.0  |  双周期可比 · 离线样本库 · 模糊追问 · 多品牌对比[/dim]
+[dim]Reputation Quick Check Tool v3.0  |  口径纯净 · 样本稳定 · 项目管理 · 客户版纪要[/dim]
     """
     console.print(banner)
 
@@ -435,8 +614,10 @@ def main():
     args = arg_parser.parse_args()
 
     config = load_config(args.config)
+    pm = get_project_manager()
 
     use_library = not args.no_library
+    library_mode = args.library_mode if use_library else "off"
 
     if args.brand:
         params = build_query_params_from_args(args)
@@ -448,24 +629,41 @@ def main():
             console.print("\n[red]非交互模式下必须指定 --brand 参数[/red]")
             sys.exit(1)
 
+    project: Optional[ResearchProject] = None
+    if args.project:
+        existing = next((p for p in pm.list_projects() if p.name == args.project), None)
+        if existing:
+            project = existing
+            console.print(f"[cyan]📂 已加载项目: {project.name} (ID: {project.project_id})[/cyan]")
+        else:
+            project = pm.create_project(name=args.project, params=params)
+            console.print(f"[bold green]✓ 新项目已创建: {project.name} (ID: {project.project_id})[/bold green]")
+
     console.print()
 
     if args.compare:
         if not params.competing_brands:
             console.print("[yellow]--compare 需要配合 --competitors 指定至少一个竞品[/yellow]")
             sys.exit(1)
-        comp_result = run_batch_comparison(params, config, use_library=use_library)
+        comp_result = run_batch_comparison(params, config, use_library=use_library, library_mode=library_mode)
         report_gen = ReportGenerator(config=config)
         report_gen.print_batch_comparison(comp_result)
+
+        if args.export_compare is not None:
+            filepath = report_gen.export_comparison_minutes(comp_result, output_dir=args.export_compare)
+            console.print(f"\n[bold green]✓ 客户版对比纪要已保存:[/bold green] [underline]{os.path.abspath(filepath)}[/underline]")
+            if project:
+                pm.add_exported_comparison(project, os.path.abspath(filepath))
+
         if args.no_interactive:
             return
         dummy_result = list(comp_result.brand_results.values())[0] if comp_result.brand_results else None
         if dummy_result:
-            if interactive_session(dummy_result, config, params):
+            if interactive_session(dummy_result, config, params, project=project, library_mode=library_mode):
                 pass
             return
 
-    result, _ = run_analysis(params, config, use_library=use_library)
+    result, _ = run_analysis(params, config, use_library=use_library, library_mode=library_mode)
     report_gen = generate_report(result, config=config)
 
     if args.export is not None:
@@ -473,19 +671,28 @@ def main():
             minutes = report_gen.build_meeting_minutes(result)
             filepath = report_gen.export_meeting_minutes(minutes, output_dir=args.export)
         console.print(f"\n[bold green]✓ 会议纪要已保存:[/bold green] [underline]{os.path.abspath(filepath)}[/underline]")
+        if project:
+            pm.add_exported_minutes(project, os.path.abspath(filepath))
+
+    if args.export_compare is not None and params.competing_brands:
+        comp_result = run_batch_comparison(params, config, use_library=use_library, library_mode=library_mode)
+        filepath = report_gen.export_comparison_minutes(comp_result, output_dir=args.export_compare)
+        console.print(f"[bold green]✓ 客户版对比纪要已保存:[/bold green] [underline]{os.path.abspath(filepath)}[/underline]")
+        if project:
+            pm.add_exported_comparison(project, os.path.abspath(filepath))
 
     if args.no_interactive:
         return
 
     try:
         while True:
-            should_restart = interactive_session(result, config, params)
+            should_restart = interactive_session(result, config, params, project=project, library_mode=library_mode)
             if not should_restart:
                 break
             console.clear()
             show_banner()
             params = build_query_params_interactive()
-            result, _ = run_analysis(params, config, use_library=use_library)
+            result, _ = run_analysis(params, config, use_library=use_library, library_mode=library_mode)
             report_gen.print_full_report(result)
     except KeyboardInterrupt:
         console.print("\n\n[yellow]程序被中断，再见！[/yellow]")
