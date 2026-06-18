@@ -7,14 +7,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.progress import BarColumn
 from rich import box
 from rich.columns import Columns
 
 from models import (
     AnalysisResult, SentimentType, MeetingMinutes,
     MeetingMinutesItem, TrackingIssue, InterviewDirection,
-    ComplaintDetail, VolumeTrendPoint
+    ComplaintDetail, VolumeTrendPoint, BatchComparisonResult,
+    BrandComparisonRow
 )
 from analyzer import Analyzer
 
@@ -37,14 +37,14 @@ class ReportGenerator:
         label, color = mapping.get(sentiment, ("未知", "white"))
         return Text(label, style=f"bold {color}")
 
-    def _change_arrow(self, value: float, positive_good: bool = True) -> Text:
+    def _change_arrow(self, value: float, positive_good: bool = True) -> str:
         if value > 0.5:
             style = "bold green" if positive_good else "bold red"
-            return Text(f"↑ {value:+.1f}%", style=style)
+            return f"[{style}]↑ {value:+.1f}%[/{style}]"
         elif value < -0.5:
             style = "bold red" if positive_good else "bold green"
-            return Text(f"↓ {value:+.1f}%", style=style)
-        return Text(f"→ {value:+.1f}%", style="bold yellow")
+            return f"[{style}]↓ {value:+.1f}%[/{style}]"
+        return f"[bold yellow]→ {value:+.1f}%[/bold yellow]"
 
     def _make_bar(self, ratio: float, width: int = 20, positive: bool = False) -> str:
         ratio = max(0.0, min(1.0, ratio))
@@ -82,19 +82,27 @@ class ReportGenerator:
             f"[bold]{va.time_range_posts}[/bold] 帖"
         )
         kpi_table.add_row(
+            "上一周期讨论量",
+            f"{va.previous_range_posts} 帖"
+        )
+        kpi_table.add_row(
             "环比变化",
-            self._change_arrow(va.volume_change_rate, positive_good=True).plain
+            self._change_arrow(va.volume_change_rate, positive_good=True)
         )
         kpi_table.add_row(
             "负面占比",
             f"[bold red]{va.negative_ratio:.1f}%[/bold red]"
         )
         kpi_table.add_row(
+            "上一周期负面占比",
+            f"{va.previous_negative_ratio:.1f}%"
+        )
+        kpi_table.add_row(
             "负面占比环比变化",
-            self._change_arrow(va.negative_ratio_change, positive_good=False).plain
+            self._change_arrow(va.negative_ratio_change, positive_good=False)
         )
 
-        console.print(Panel(kpi_table, title="核心指标", border_style="cyan"))
+        console.print(Panel(kpi_table, title="核心指标（含上一周期可比数据）", border_style="cyan"))
 
         if va.by_source:
             src_table = Table(title="各平台分布", box=box.MINIMAL, show_lines=False)
@@ -113,11 +121,10 @@ class ReportGenerator:
     def _print_trend_chart(self, points: List[VolumeTrendPoint]):
         chart_title = "讨论量趋势（按时间分段）"
         max_total = max((p.total_count for p in points), default=1)
-        max_date_len = 16
 
         console.print(f"\n[bold]{chart_title}[/bold]")
         table = Table(box=box.HORIZONTALS, show_lines=False)
-        table.add_column("时段", style="cyan", width=max_date_len)
+        table.add_column("时段", style="cyan", width=12)
         table.add_column("总量", justify="right")
         table.add_column("分布图", min_width=25)
         table.add_column("负面占比", justify="right", style="red")
@@ -211,8 +218,12 @@ class ReportGenerator:
             console.print(Panel(body, title=header, border_style=border_color, expand=True))
 
     def print_complaint_detail(self, detail: ComplaintDetail, keyword: str):
+        matched_note = ""
+        if detail.matched_keyword and detail.matched_keyword != keyword:
+            matched_note = f"（模糊匹配到：[bold yellow]{detail.matched_keyword}[/bold yellow]）"
+
         console.print(Panel(
-            f"[bold]槽点深挖: {keyword}[/bold]",
+            f"[bold]槽点深挖: {keyword}[/bold] {matched_note}",
             border_style="bold red",
             expand=True
         ))
@@ -243,13 +254,19 @@ class ReportGenerator:
 
         console.print(Panel(info_table, title="核心信息", border_style="magenta"))
 
-        if detail.typical_expressions:
-            console.print(f"\n[bold]典型表达 (Top {len(detail.typical_expressions)}):[/bold]")
+        if detail.grouped_expressions:
+            console.print(f"\n[bold]代表性原话（按相似表达分组，共 {len(detail.grouped_expressions)} 组）:[/bold]")
+            for gi, group in enumerate(detail.grouped_expressions, 1):
+                console.print(f"\n[bold red]第 {gi} 组 · {group.group_key}[/bold red]（[bold]{group.count}[/bold] 次提及）")
+                for ei, ex in enumerate(group.examples, 1):
+                    console.print(f"  [{ei}]「{ex}」")
+        elif detail.typical_expressions:
+            console.print(f"\n[bold]典型表达 (Top {min(len(detail.typical_expressions), 8)}):[/bold]")
             expr_table = Table(box=box.MINIMAL, show_lines=False)
             expr_table.add_column("#", justify="right", style="dim")
             expr_table.add_column("典型表达")
             expr_table.add_column("次数", justify="right")
-            for i, (expr, cnt) in enumerate(detail.typical_expressions, 1):
+            for i, (expr, cnt) in enumerate(detail.typical_expressions[:8], 1):
                 expr_table.add_row(str(i), expr, f"[bold]{cnt}[/bold]")
             console.print(expr_table)
 
@@ -274,12 +291,137 @@ class ReportGenerator:
                 time_str = p.publish_time.strftime(self.datetime_format) if p.publish_time else ""
                 console.print(f"  • [cyan]{p.source}[/cyan] {time_str} [italic]{p.title}[/italic]")
 
+    def print_batch_comparison(self, comp: BatchComparisonResult):
+        console.print(Panel(
+            f"[bold magenta]目标品牌:[/bold magenta] {comp.target_brand}\n"
+            f"[bold magenta]对比品牌:[/bold magenta] {', '.join(b for b in comp.brands if b != comp.target_brand)}\n"
+            f"[bold magenta]时间范围:[/bold magenta] {comp.time_range or '全量'}\n"
+            f"[dim]生成时间: {comp.generated_at.strftime(self.datetime_format)}[/dim]",
+            title="[bold red]批量竞品对比报告[/bold red]",
+            border_style="red",
+            expand=True,
+        ))
+
+        console.print("\n[bold underline red]【一、总体指标对照表】[/bold underline red]")
+        rows_sorted = sorted(comp.rows, key=lambda r: (not r.is_target, -r.risk_score))
+
+        main_table = Table(title="品牌对比总览（按目标品牌+风险排序）", box=box.ROUNDED, expand=True)
+        main_table.add_column("品牌", style="bold")
+        main_table.add_column("类型", justify="center")
+        main_table.add_column("讨论量", justify="right")
+        main_table.add_column("环比", justify="right")
+        main_table.add_column("负面占比", justify="right")
+        main_table.add_column("Top 差评", justify="left")
+        main_table.add_column("Top 好评", justify="left")
+        main_table.add_column("带节奏%", justify="right")
+        main_table.add_column("官方响应%", justify="right")
+        main_table.add_column("风险分", justify="center")
+
+        for r in rows_sorted:
+            brand_type = "[bold blue]★ 目标[/bold blue]" if r.is_target else "竞品"
+
+            volume_arrow = self._change_arrow(r.volume_change_rate, positive_good=True)
+            if r.volume_change_rate > 30:
+                volume_arrow += " ⚠"
+
+            neg_style = "red bold" if r.negative_ratio > 50 else ("yellow" if r.negative_ratio > 35 else "green")
+            neg_col = f"[{neg_style}]{r.negative_ratio:.1f}%[/{neg_style}]"
+
+            top_comp = f"{r.top_complaint}({r.top_complaint_count})" if r.top_complaint else "-"
+            top_adv = f"{r.top_advantage}({r.top_advantage_count})" if r.top_advantage else "-"
+
+            troll_style = "bold yellow" if r.troll_ratio > 30 else ""
+            troll_col = f"[{troll_style}]{r.troll_ratio:.1f}%[/{troll_style}]" if troll_style else f"{r.troll_ratio:.1f}%"
+
+            resp_style = "green bold" if r.official_response_ratio > 30 else ("yellow" if r.official_response_ratio > 15 else "red bold")
+            resp_col = f"[{resp_style}]{r.official_response_ratio:.1f}%[/{resp_style}]"
+
+            if r.risk_score >= 4:
+                risk_col = f"[bold red]■■ {r.risk_score}[/bold red]"
+            elif r.risk_score >= 2:
+                risk_col = f"[bold yellow]■ {r.risk_score}[/bold yellow]"
+            else:
+                risk_col = f"[green] {r.risk_score}[/green]"
+
+            main_table.add_row(
+                r.brand, brand_type, str(r.total_posts), volume_arrow, neg_col,
+                top_comp, top_adv, troll_col, resp_col, risk_col
+            )
+        console.print(main_table)
+
+        console.print("\n[bold underline red]【二、槽点横向对比】[/bold underline red]")
+        all_complaints: Dict[str, Dict[str, int]] = {}
+        for r in comp.rows:
+            if r.top_complaint:
+                all_complaints.setdefault(r.brand, {})
+                all_complaints[r.brand][r.top_complaint] = r.top_complaint_count
+
+        target_row = next((r for r in comp.rows if r.is_target), None)
+        if target_row and target_row.top_complaint:
+            console.print(f"\n[yellow]→ 目标品牌「{comp.target_brand}」核心槽点：[bold red]{target_row.top_complaint}[/bold red][/yellow]")
+
+            compare_table = Table(title=f"围绕「{target_row.top_complaint}」的竞品情况", box=box.MINIMAL)
+            compare_table.add_column("品牌", style="bold")
+            compare_table.add_column("该槽点提及数", justify="right")
+            compare_table.add_column("相对严重度", justify="right")
+            target_count = target_row.top_complaint_count
+            for r in comp.rows:
+                mention_count = r.top_complaint_count if r.top_complaint == target_row.top_complaint else 0
+                if mention_count == 0:
+                    severity = "[dim]—[/dim]"
+                elif target_count == 0:
+                    severity = f"[yellow]高（{mention_count}次）[/yellow]"
+                else:
+                    ratio = mention_count / target_count
+                    if ratio >= 1.2:
+                        severity = f"[red]比目标严重 {ratio:.1f}x[/red]"
+                    elif ratio >= 0.8:
+                        severity = f"[yellow]接近目标[/yellow]"
+                    else:
+                        severity = f"[green]优于目标 {ratio:.1f}x[/green]"
+                compare_table.add_row(r.brand, str(mention_count), severity)
+            console.print(compare_table)
+
+        console.print("\n[bold underline red]【三、风险与建议摘要】[/bold underline red]")
+        sorted_by_risk = sorted(comp.rows, key=lambda r: -r.risk_score)
+        for r in sorted_by_risk:
+            if r.is_target:
+                console.print(f"\n[bold blue]★ 目标品牌 {r.brand}：[/bold blue]风险分 {r.risk_score}/6")
+                tips = []
+                if r.negative_ratio > 50:
+                    tips.append("负面讨论过半，建议紧急关注")
+                if r.volume_change_rate > 30:
+                    tips.append("讨论量快速上升，需确认是否有事件发酵")
+                if r.troll_ratio > 30:
+                    tips.append(f"疑似竞品带节奏比例高（{r.troll_ratio:.0f}%），建议舆情研判")
+                if r.official_response_ratio < 15 and r.negative_ratio > 30:
+                    tips.append("官方响应率偏低，建议补充危机话术")
+                if r.top_complaint and r.top_complaint_count >= max(3, r.total_posts * 0.2):
+                    tips.append(f"「{r.top_complaint}」集中爆发，建议重点访谈")
+                if tips:
+                    for t in tips:
+                        console.print(f"  ⚠ {t}")
+                else:
+                    console.print("  ✓ 各项指标正常，常规观察即可")
+            else:
+                console.print(f"\n[bold]竞品 {r.brand}：[/bold]风险分 {r.risk_score}/6")
+                insights = []
+                if r.top_advantage and r.top_advantage_count >= 3:
+                    insights.append(f"突出优势：{r.top_advantage}（{r.top_advantage_count}次），可对标学习")
+                if r.official_response_ratio > target_row.official_response_ratio if target_row else False:
+                    insights.append(f"官方响应率{r.official_response_ratio:.0f}%，优于目标品牌")
+                if r.troll_ratio < (target_row.troll_ratio if target_row else 999):
+                    insights.append(f"带节奏率较低（{r.troll_ratio:.0f}%），舆情环境相对干净")
+                if insights:
+                    for ins in insights:
+                        console.print(f"  ✓ 可借鉴点：{ins}")
+
     def print_full_report(self, result: AnalysisResult):
         self.print_header(result)
         self.print_volume_section(result)
         self.print_theme_section(result)
         self.print_representative_posts(result)
-        console.print("\n[dim]提示: 输入「追问 槽点关键词」可深挖该问题；输入「导出」保存为会议纪要[/dim]")
+        console.print("\n[dim]提示: 输入「追问 槽点关键词」可深挖；输入「对比」可批量竞品对照；输入「导出」保存会议纪要[/dim]")
 
     def build_meeting_minutes(self, result: AnalysisResult) -> MeetingMinutes:
         params = result.query_params
@@ -295,8 +437,14 @@ class ReportGenerator:
         )
 
         findings = []
-        findings.append(f"监测期间[{params.time_range}]共获取讨论 {va.time_range_posts} 条，环比变化 {va.volume_change_rate:+.1f}%。")
-        findings.append(f"负面讨论占比 {va.negative_ratio:.1f}%，环比{va.negative_ratio_change:+.1f}个百分点。")
+        findings.append(
+            f"监测期间[{params.time_range}]共获取讨论 {va.time_range_posts} 条，"
+            f"对比上一周期({va.previous_range_posts}条)环比变化 {va.volume_change_rate:+.1f}%。"
+        )
+        findings.append(
+            f"负面讨论占比 {va.negative_ratio:.1f}%，"
+            f"对比上一周期({va.previous_negative_ratio:.1f}%)变化{va.negative_ratio_change:+.1f}个百分点。"
+        )
         if va.by_source:
             top_src = max(va.by_source.items(), key=lambda x: x[1])
             findings.append(f"主要讨论平台为「{top_src[0]}」({top_src[1]}条)。")
@@ -320,8 +468,8 @@ class ReportGenerator:
             ))
 
         if ta.complaints:
+            analyzer = Analyzer(self.config)
             for comp in ta.complaints[:5]:
-                analyzer = Analyzer(self.config)
                 detail = analyzer.get_complaint_detail(comp.keyword, result)
                 priority = "高" if detail.frequency_trend in ("骤升", "上升") or detail.troll_ratio > 30 else "中"
                 if detail.total_mentions < 3:

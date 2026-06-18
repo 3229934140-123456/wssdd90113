@@ -113,10 +113,19 @@ class ThemeAnalysis:
 
 
 @dataclass
+class ExpressionGroup:
+    group_key: str
+    count: int
+    examples: List[str] = field(default_factory=list)
+
+
+@dataclass
 class ComplaintDetail:
     complaint_keyword: str
     total_mentions: int
+    matched_keyword: str = ""
     typical_expressions: List[Tuple[str, int]] = field(default_factory=list)
+    grouped_expressions: List[ExpressionGroup] = field(default_factory=list)
     frequency_trend: str = ""
     is_competitor_troll: bool = False
     competitor_brand: Optional[str] = None
@@ -171,3 +180,29 @@ class MeetingMinutes:
     tracking_issues: List[TrackingIssue] = field(default_factory=list)
     interview_directions: List[InterviewDirection] = field(default_factory=list)
     raw_analysis_ref: str = ""
+
+
+@dataclass
+class BrandComparisonRow:
+    brand: str
+    is_target: bool = False
+    total_posts: int = 0
+    negative_ratio: float = 0.0
+    volume_change_rate: float = 0.0
+    top_complaint: str = ""
+    top_complaint_count: int = 0
+    top_advantage: str = ""
+    top_advantage_count: int = 0
+    troll_ratio: float = 0.0
+    official_response_ratio: float = 0.0
+    risk_score: int = 0
+
+
+@dataclass
+class BatchComparisonResult:
+    brands: List[str]
+    target_brand: str
+    time_range: Optional[TimeRange]
+    rows: List[BrandComparisonRow] = field(default_factory=list)
+    generated_at: datetime = field(default_factory=datetime.now)
+    brand_results: Dict[str, AnalysisResult] = field(default_factory=dict)

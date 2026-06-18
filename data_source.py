@@ -1,12 +1,13 @@
 import random
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import uuid
 
 from models import (
     Post, QueryParams, SentimentType, PostType,
     TimeRange
 )
+from sample_library import SampleLibrary, get_library
 
 
 BRAND_TEMPLATES: Dict[str, Dict] = {
@@ -114,6 +115,7 @@ AUTHOR_LEVELS = [
 
 class DataSourceSimulator:
     def __init__(self, seed: Optional[int] = None):
+        self._seed = seed
         if seed is not None:
             random.seed(seed)
 
@@ -128,7 +130,7 @@ class DataSourceSimulator:
         sentiment: SentimentType,
         focus_themes: List[str],
         competing_brands: List[str],
-    ) -> tuple[str, List[str], str, Optional[str], bool]:
+    ) -> Tuple[str, List[str], str, Optional[str], bool]:
         template = self._get_template(brand)
         content_parts: List[str] = []
         keywords: List[str] = []
@@ -220,8 +222,95 @@ class DataSourceSimulator:
             weights=weights, k=1
         )[0]
 
-    def fetch_posts(self, params: QueryParams, count: int = 200) -> List[Post]:
+    def _generate_posts_for_range(
+        self,
+        brand: str,
+        time_range: TimeRange,
+        count: int,
+        focus_themes: List[str],
+        competing_brands: List[str],
+        data_sources: List[str],
+    ) -> List[Post]:
         posts: List[Post] = []
+        total_days = max(1, (time_range.end_date - time_range.start_date).days)
+
+        for _ in range(count):
+            sentiment = self._pick_sentiment(brand, focus_themes)
+            source_name, source_type = random.choice(FORUM_SOURCES)
+            if data_sources and source_name not in data_sources:
+                continue
+
+            random_days = random.uniform(0, total_days)
+            publish_time = time_range.start_date + timedelta(days=random_days)
+            publish_time = publish_time.replace(
+                hour=random.randint(0, 23),
+                minute=random.randint(0, 59),
+                second=random.randint(0, 59)
+            )
+
+            content, keywords, summary, comp_ref, is_troll = self._generate_content(
+                brand=brand,
+                sentiment=sentiment,
+                focus_themes=focus_themes,
+                competing_brands=competing_brands,
+            )
+
+            title = self._generate_title(brand, sentiment, focus_themes)
+
+            sentiment_score_map = {
+                SentimentType.POSITIVE: random.uniform(0.65, 0.95),
+                SentimentType.NEGATIVE: random.uniform(0.05, 0.35),
+                SentimentType.NEUTRAL: random.uniform(0.45, 0.55),
+                SentimentType.QUESTION: random.uniform(0.40, 0.60),
+            }
+
+            has_official_resp = False
+            official_resp_examples: List[str] = []
+            if sentiment == SentimentType.NEGATIVE and random.random() < 0.2:
+                has_official_resp = True
+                official_resp_examples.append(random.choice(OFFICIAL_RESPONSES).format(brand=brand))
+
+            themes = list(set(keywords + ([t for t in focus_themes if any(t in kw or kw in t for kw in keywords)] if focus_themes else [])))
+
+            post = Post(
+                post_id=str(uuid.uuid4())[:8],
+                title=title,
+                content=content,
+                author=random.choice(AUTHOR_NAMES),
+                author_level=random.choice(AUTHOR_LEVELS),
+                brand=brand,
+                source=source_name,
+                source_type=source_type,
+                post_type=PostType.MAIN_POST if random.random() < 0.7 else PostType.COMMENT,
+                parent_id=None,
+                publish_time=publish_time,
+                sentiment=sentiment,
+                sentiment_score=sentiment_score_map[sentiment],
+                likes=random.randint(0, 500) if sentiment in (SentimentType.POSITIVE, SentimentType.NEGATIVE) else random.randint(0, 50),
+                comments_count=random.randint(0, 200),
+                views=random.randint(100, 50000),
+                themes=themes,
+                keywords=keywords,
+                is_competing_brand_troll=is_troll,
+                competing_brand_ref=comp_ref,
+                has_official_response=has_official_resp,
+                summary=summary,
+                representative_quotes=[summary] + official_resp_examples,
+            )
+            posts.append(post)
+        return posts
+
+    def fetch_posts_with_library(
+        self,
+        params: QueryParams,
+        count: int = 200,
+        library: Optional[SampleLibrary] = None,
+        use_library: bool = True,
+    ) -> Tuple[List[Post], Dict]:
+        """
+        生成/获取双周期数据：前一周期 + 当前周期，保证环比有意义。
+        优先从离线样本库中按品牌+时间范围读取，不足部分生成后入库。
+        """
         if params.time_range is None:
             end = datetime.now()
             start = end - timedelta(days=30)
@@ -229,80 +318,90 @@ class DataSourceSimulator:
         else:
             time_range = params.time_range
 
-        total_days = max(1, (time_range.end_date - time_range.start_date).days)
+        range_days = max(1, (time_range.end_date - time_range.start_date).days)
+        prev_start = time_range.start_date - timedelta(days=range_days)
+        prev_end = time_range.start_date - timedelta(seconds=1)
+        full_start = prev_start
+        full_end = time_range.end_date
+        full_range = TimeRange(start_date=full_start, end_date=full_end)
+
         brands_to_collect = [params.target_brand] + params.competing_brands
+        sources_filter = params.data_sources or []
+
+        lib_stats = {"library_hit": 0, "new_generated": 0, "saved": 0}
+        all_posts: List[Post] = []
+
+        if use_library:
+            if library is None:
+                library = get_library()
+            existing = library.fetch_by_brands_and_time(
+                brands=brands_to_collect,
+                start_date=full_start,
+                end_date=full_end,
+                sources=sources_filter if sources_filter else None,
+            )
+            all_posts.extend(existing)
+            lib_stats["library_hit"] = len(existing)
 
         for brand in brands_to_collect:
-            brand_count = int(count * (0.6 if brand == params.target_brand else 0.4 / max(1, len(params.competing_brands))))
-            for i in range(brand_count):
-                sentiment = self._pick_sentiment(brand, params.focus_themes)
-                source_name, source_type = random.choice(FORUM_SOURCES)
-                if params.data_sources and source_name not in params.data_sources:
-                    continue
+            target_share = 0.6 if brand == params.target_brand else 0.4 / max(1, len(params.competing_brands))
+            desired_count = int(count * target_share)
 
-                random_days = random.uniform(0, total_days)
-                publish_time = time_range.start_date + timedelta(days=random_days)
-                publish_time = publish_time.replace(
-                    hour=random.randint(0, 23),
-                    minute=random.randint(0, 59),
-                    second=random.randint(0, 59)
-                )
+            existing_for_brand = [p for p in all_posts if p.brand == brand]
+            if len(existing_for_brand) >= desired_count:
+                continue
+            need_count = desired_count - len(existing_for_brand)
 
-                content, keywords, summary, comp_ref, is_troll = self._generate_content(
-                    brand=brand,
-                    sentiment=sentiment,
-                    focus_themes=params.focus_themes,
-                    competing_brands=params.competing_brands if brand == params.target_brand else [],
-                )
+            current_count_current = int(need_count * 0.55)
+            current_count_prev = need_count - current_count_current
 
-                title = self._generate_title(brand, sentiment, params.focus_themes)
+            competing = params.competing_brands if brand == params.target_brand else []
 
-                sentiment_score_map = {
-                    SentimentType.POSITIVE: random.uniform(0.65, 0.95),
-                    SentimentType.NEGATIVE: random.uniform(0.05, 0.35),
-                    SentimentType.NEUTRAL: random.uniform(0.45, 0.55),
-                    SentimentType.QUESTION: random.uniform(0.40, 0.60),
-                }
+            new_current = self._generate_posts_for_range(
+                brand=brand,
+                time_range=time_range,
+                count=current_count_current,
+                focus_themes=params.focus_themes,
+                competing_brands=competing,
+                data_sources=sources_filter,
+            )
+            prev_tr = TimeRange(start_date=prev_start, end_date=prev_end)
+            new_prev = self._generate_posts_for_range(
+                brand=brand,
+                time_range=prev_tr,
+                count=current_count_prev,
+                focus_themes=params.focus_themes,
+                competing_brands=competing,
+                data_sources=sources_filter,
+            )
 
-                has_official_resp = False
-                official_resp_examples: List[str] = []
-                if sentiment == SentimentType.NEGATIVE and random.random() < 0.2:
-                    has_official_resp = True
-                    official_resp_examples.append(random.choice(OFFICIAL_RESPONSES).format(brand=brand))
+            new_posts = new_current + new_prev
+            all_posts.extend(new_posts)
+            lib_stats["new_generated"] += len(new_posts)
 
-                themes = list(set(keywords + ([t for t in params.focus_themes if any(t in kw or kw in t for kw in keywords)] if params.focus_themes else [])))
+            if use_library and library is not None and new_posts:
+                saved = library.save_posts(new_posts)
+                lib_stats["saved"] += saved
 
-                post = Post(
-                    post_id=str(uuid.uuid4())[:8],
-                    title=title,
-                    content=content,
-                    author=random.choice(AUTHOR_NAMES),
-                    author_level=random.choice(AUTHOR_LEVELS),
-                    brand=brand,
-                    source=source_name,
-                    source_type=source_type,
-                    post_type=PostType.MAIN_POST if random.random() < 0.7 else PostType.COMMENT,
-                    parent_id=None,
-                    publish_time=publish_time,
-                    sentiment=sentiment,
-                    sentiment_score=sentiment_score_map[sentiment],
-                    likes=random.randint(0, 500) if sentiment in (SentimentType.POSITIVE, SentimentType.NEGATIVE) else random.randint(0, 50),
-                    comments_count=random.randint(0, 200),
-                    views=random.randint(100, 50000),
-                    themes=themes,
-                    keywords=keywords,
-                    is_competing_brand_troll=is_troll,
-                    competing_brand_ref=comp_ref,
-                    has_official_response=has_official_resp,
-                    summary=summary,
-                    representative_quotes=[summary] + official_resp_examples,
-                )
-                posts.append(post)
+        all_posts.sort(key=lambda p: p.publish_time or datetime.now(), reverse=True)
+        return all_posts, lib_stats
 
-        posts.sort(key=lambda p: p.publish_time or datetime.now(), reverse=True)
+    def fetch_posts(self, params: QueryParams, count: int = 200) -> List[Post]:
+        posts, _ = self.fetch_posts_with_library(params, count=count, use_library=False)
         return posts
 
 
 def fetch_posts(params: QueryParams, count: int = 200, seed: Optional[int] = None) -> List[Post]:
     simulator = DataSourceSimulator(seed=seed)
     return simulator.fetch_posts(params, count=count)
+
+
+def fetch_posts_with_library(
+    params: QueryParams,
+    count: int = 200,
+    seed: Optional[int] = None,
+    use_library: bool = True,
+    library: Optional[SampleLibrary] = None,
+) -> Tuple[List[Post], Dict]:
+    simulator = DataSourceSimulator(seed=seed)
+    return simulator.fetch_posts_with_library(params, count=count, use_library=use_library, library=library)

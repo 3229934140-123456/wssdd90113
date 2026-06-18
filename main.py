@@ -9,18 +9,24 @@ import sys
 import os
 import argparse
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import yaml
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
+from rich.table import Table
+from rich import box
 from rich import print as rprint
 
-from models import QueryParams, TimeRange, AnalysisResult, ComplaintDetail
-from data_source import fetch_posts
+from models import (
+    QueryParams, TimeRange, AnalysisResult, ComplaintDetail,
+    BatchComparisonResult
+)
+from data_source import fetch_posts_with_library
 from analyzer import analyze, Analyzer
 from report_generator import ReportGenerator, generate_report
+from sample_library import get_library, SampleLibrary
 
 
 console = Console()
@@ -146,26 +152,122 @@ def build_query_params_from_args(args) -> QueryParams:
     )
 
 
-def run_analysis(params: QueryParams, config: dict) -> AnalysisResult:
-    with console.status("[bold green]正在抓取论坛数据...[/bold green]") as status:
-        posts = fetch_posts(params, count=300, seed=42)
-        status.update("[bold green]数据抓取完成，正在分析...[/bold green]")
+def run_analysis(
+    params: QueryParams,
+    config: dict,
+    use_library: bool = True,
+) -> Tuple[AnalysisResult, dict]:
+    library = get_library() if use_library else None
+
+    status_text = "[bold green]正在从样本库读取+补充生成数据...[/bold green]" if use_library else "[bold green]正在生成模拟数据...[/bold green]"
+    with console.status(status_text) as status:
+        posts, lib_stats = fetch_posts_with_library(
+            params, count=400, use_library=use_library, library=library
+        )
+        status.update("[bold green]数据准备完成，正在分析...[/bold green]")
         result = analyze(posts, params, config=config)
-        return result
+
+    if use_library:
+        hint_parts = []
+        if lib_stats.get("library_hit", 0) > 0:
+            hint_parts.append(f"样本库命中 {lib_stats['library_hit']} 条")
+        if lib_stats.get("new_generated", 0) > 0:
+            hint_parts.append(f"新生成 {lib_stats['new_generated']} 条")
+        if lib_stats.get("saved", 0) > 0:
+            hint_parts.append(f"已入库 {lib_stats['saved']} 条")
+        if hint_parts:
+            console.print(f"  [dim]📚 {' | '.join(hint_parts)}[/dim]")
+
+    return result, lib_stats
 
 
-def interactive_session(result: AnalysisResult, config: dict):
+def run_batch_comparison(
+    params: QueryParams,
+    config: dict,
+    use_library: bool = True,
+) -> BatchComparisonResult:
+    library = get_library() if use_library else None
+
+    with console.status("[bold green]正在准备多品牌对比数据...[/bold green]") as status:
+        posts, lib_stats = fetch_posts_with_library(
+            params, count=500, use_library=use_library, library=library
+        )
+        status.update("[bold green]正在执行批量对比分析...[/bold green]")
+        analyzer = Analyzer(config=config)
+        comp_result = analyzer.compare_brands(
+            all_posts=posts,
+            target_brand=params.target_brand,
+            competing_brands=params.competing_brands,
+            time_range=params.time_range,
+        )
+
+    comp_result.brand_results = {}
+    brands = [params.target_brand] + params.competing_brands
+    for brand in brands:
+        sub_params = QueryParams(
+            target_brand=brand,
+            competing_brands=[b for b in brands if b != brand],
+            time_range=params.time_range,
+            focus_themes=params.focus_themes,
+        )
+        comp_result.brand_results[brand] = analyze(posts, sub_params, config=config)
+
+    return comp_result
+
+
+def print_library_status():
+    library = get_library()
+    brands = library.list_brands()
+    if not brands:
+        console.print("[dim]样本库当前为空，下次查询时会自动写入。[/dim]")
+        return
+
+    console.print(f"\n[bold cyan]📚 离线样本库（共 {len(brands)} 个品牌）:[/bold cyan]")
+    table = Table(box=box.MINIMAL, show_lines=False)
+    table.add_column("品牌", style="bold")
+    table.add_column("累计帖数", justify="right")
+    table.add_column("最新帖子时间", justify="right")
+    for brand, count, latest in brands:
+        latest_str = "-"
+        if latest:
+            try:
+                latest_str = datetime.fromisoformat(latest).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                latest_str = str(latest)[:16]
+        table.add_row(brand, f"{count:,}", latest_str)
+    console.print(table)
+
+
+def clear_library_brand(brand: str):
+    library = get_library()
+    info = library.count_by_brand(brand)
+    if info["total"] == 0:
+        console.print(f"[dim]样本库中没有「{brand}」的数据。[/dim]")
+        return
+    if Confirm.ask(f"确认要清空样本库中「{brand}」的 {info['total']} 条数据吗？", default=False):
+        removed = library.clear_brand(brand)
+        console.print(f"[green]✓ 已删除 {removed} 条「{brand}」相关数据。[/green]")
+
+
+def interactive_session(
+    result: AnalysisResult,
+    config: dict,
+    params: QueryParams,
+):
     report_gen = ReportGenerator(config=config)
     analyzer_engine = Analyzer(config=config)
 
     console.print()
     console.print(Panel(
         "[bold]命令提示:[/bold]\n"
-        "  [cyan]追问 <槽点关键词>[/cyan]  深挖某个槽点\n"
-        "  [cyan]列表[/cyan]                   查看所有槽点/优点/疑问关键词\n"
-        "  [cyan]导出[/cyan]                   保存为会议纪要格式\n"
-        "  [cyan]新查询[/cyan]                 开始新一轮调研\n"
-        "  [cyan]退出[/cyan]                   退出程序",
+        "  [cyan]追问 <任意描述>[/cyan]   深挖槽点（支持模糊，如「追问售后为什么差」「追问涨价」）\n"
+        "  [cyan]列表[/cyan]                    查看所有关键词\n"
+        "  [cyan]对比[/cyan]                    输出多品牌批量对比摘要\n"
+        "  [cyan]导出[/cyan]                    保存为会议纪要格式\n"
+        "  [cyan]样本库|库[/cyan]              查看离线样本库状态\n"
+        "  [cyan]清空 <品牌>[/cyan]           清空某品牌的样本库数据\n"
+        "  [cyan]新查询[/cyan]                  开始新一轮调研\n"
+        "  [cyan]退出[/cyan]                    退出程序",
         border_style="yellow",
         expand=False,
     ))
@@ -175,7 +277,7 @@ def interactive_session(result: AnalysisResult, config: dict):
             cmd = Prompt.ask("\n[bold blue]>[/bold blue] 请输入命令").strip()
         except (EOFError, KeyboardInterrupt):
             console.print("\n[yellow]再见！[/yellow]")
-            break
+            return False
 
         if not cmd:
             continue
@@ -184,7 +286,7 @@ def interactive_session(result: AnalysisResult, config: dict):
 
         if cmd_lower in ["退出", "exit", "quit", "q"]:
             console.print("[yellow]再见！[/yellow]")
-            break
+            return False
 
         elif cmd_lower in ["重绘", "report", "r"]:
             report_gen.print_full_report(result)
@@ -201,31 +303,20 @@ def interactive_session(result: AnalysisResult, config: dict):
 
         elif cmd_lower.startswith("追问") or cmd_lower.startswith("dive") or cmd_lower.startswith("detail"):
             keyword = ""
-            for sep in ["追问", "dive", "detail", " "]:
-                if sep in cmd:
-                    parts = cmd.split(sep, 1)
-                    if len(parts) > 1:
-                        keyword = parts[1].strip()
-                        break
-            if not keyword:
-                keyword = Prompt.ask("请输入要深挖的槽点关键词")
-            keyword = keyword.strip()
-
-            ta = result.theme_analysis
-            matched = None
-            for source in [ta.complaints, ta.advantages, ta.questions]:
-                for kw in source:
-                    if kw.keyword == keyword or keyword in kw.keyword or kw.keyword in keyword:
-                        matched = kw.keyword
-                        break
-                if matched:
+            for sep in ["追问", "dive", "detail"]:
+                idx = cmd_lower.find(sep)
+                if idx >= 0:
+                    keyword = cmd[idx + len(sep):].strip()
+                    keyword = keyword.lstrip(" :：-—")
                     break
+            if not keyword:
+                keyword = Prompt.ask("请输入要深挖的描述（如「售后为什么差」「涨价」）")
+            keyword = keyword.strip()
+            if not keyword:
+                continue
 
-            if not matched:
-                matched = keyword
-
-            detail = analyzer_engine.get_complaint_detail(matched, result)
-            report_gen.print_complaint_detail(detail, matched)
+            detail = analyzer_engine.get_complaint_detail(keyword, result)
+            report_gen.print_complaint_detail(detail, keyword)
 
         elif cmd_lower in ["导出", "export", "save", "s"]:
             default_dir = config.get("output", {}).get("default_dir", "./reports")
@@ -247,6 +338,28 @@ def interactive_session(result: AnalysisResult, config: dict):
                 except Exception as e:
                     console.print(f"[yellow]无法打开目录: {e}[/yellow]")
 
+        elif cmd_lower in ["对比", "compare", "cmp", "c"]:
+            if not params.competing_brands:
+                console.print("[yellow]当前没有设置竞品，请先使用「新查询」增加竞品。[/yellow]")
+                continue
+            with console.status("[bold green]正在生成批量对比...[/bold green]"):
+                comp_result = run_batch_comparison(params, config)
+            report_gen.print_batch_comparison(comp_result)
+
+        elif cmd_lower in ["样本库", "库", "library", "lib", "db"]:
+            print_library_status()
+
+        elif cmd_lower.startswith("清空") or cmd_lower.startswith("clear"):
+            brand_to_clear = ""
+            for sep in ["清空", "clear"]:
+                idx = cmd_lower.find(sep)
+                if idx >= 0:
+                    brand_to_clear = cmd[idx + len(sep):].strip()
+                    break
+            if not brand_to_clear:
+                brand_to_clear = Prompt.ask("请输入要清空的品牌名", default=params.target_brand)
+            clear_library_brand(brand_to_clear)
+
         elif cmd_lower in ["新查询", "new", "reset", "n"]:
             if Confirm.ask("确定要开始新一轮查询吗？", default=True):
                 return True
@@ -254,13 +367,16 @@ def interactive_session(result: AnalysisResult, config: dict):
         elif cmd_lower in ["帮助", "help", "h", "?"]:
             console.print(Panel(
                 "[bold]可用命令:[/bold]\n"
-                "  [cyan]追问 <关键词>[/cyan]   深挖某个槽点（如：追问 售后差）\n"
-                "  [cyan]列表[/cyan]                列出所有关键词\n"
-                "  [cyan]重绘[/cyan]                重新显示完整报告\n"
-                "  [cyan]导出[/cyan]                保存为会议纪要TXT\n"
-                "  [cyan]新查询[/cyan]              开始新一轮调研\n"
-                "  [cyan]帮助[/cyan]                显示本帮助\n"
-                "  [cyan]退出[/cyan]                退出程序",
+                "  [cyan]追问 <描述>[/cyan]   模糊匹配后深挖槽点（如「追问售后差」「涨价」「新品翻车」）\n"
+                "  [cyan]列表[/cyan]            列出所有优点/槽点/疑问关键词\n"
+                "  [cyan]重绘[/cyan]            重新显示完整三段式报告\n"
+                "  [cyan]对比[/cyan]            目标品牌 vs 多竞品批量对照摘要\n"
+                "  [cyan]导出[/cyan]            保存会议纪要 TXT\n"
+                "  [cyan]样本库[/cyan]          查看离线样本库累计数据量\n"
+                "  [cyan]清空 <品牌>[/cyan]    清除某品牌的样本库数据\n"
+                "  [cyan]新查询[/cyan]          开始新一轮调研\n"
+                "  [cyan]帮助[/cyan]            显示本帮助\n"
+                "  [cyan]退出[/cyan]            退出程序",
                 border_style="blue",
                 title="帮助",
                 expand=False,
@@ -269,17 +385,22 @@ def interactive_session(result: AnalysisResult, config: dict):
         else:
             console.print(f"[yellow]未知命令: {cmd}，输入「帮助」查看可用命令[/yellow]")
 
-    return False
-
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reputation_checker",
-        description="品牌口碑速查工具 - 面向品牌咨询顾问的论坛贴吧声音速查工具",
+        description="品牌口碑速查工具 v2 - 面向品牌咨询顾问的论坛声音速查",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+v2 更新内容:
+  · 讨论量环比含上一周期可比数据（不再固定+100%）
+  · 离线样本库：SQLite 持久化，重启仍可复用历史帖子
+  · 追问支持模糊匹配：「追问售后为什么差」自动定位到对应槽点
+  · 新增批量对比模式：--compare 输出多品牌对照摘要
+
 示例:
   python main.py --brand 小米手机 --competitors 华为手机,苹果手机 --days 30 --themes 售后,新品,涨价
+  python main.py --brand 小米手机 --competitors 华为手机,苹果手机 --days 30 --compare
   python main.py  (进入交互模式)
         """,
     )
@@ -290,7 +411,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-e", "--end-date", type=str, help="结束日期 (YYYY-MM-DD)")
     parser.add_argument("-t", "--themes", type=str, help="关注主题，多个用逗号分隔")
     parser.add_argument("--config", type=str, default="config.yaml", help="配置文件路径")
+    parser.add_argument("--compare", action="store_true", help="输出多品牌批量对比报告")
     parser.add_argument("--export", type=str, nargs="?", const="./reports", help="直接导出为会议纪要，可指定输出目录")
+    parser.add_argument("--no-library", action="store_true", help="不使用离线样本库（仅临时生成）")
     parser.add_argument("--no-interactive", action="store_true", help="非交互模式，输出报告后直接退出")
     return parser
 
@@ -300,7 +423,7 @@ def show_banner():
 [bold magenta]░█▀█░█▀▀░█▀█░█░█░▀█▀░█▀█░▀█▀░░░░░█▀▀░█░█░█▀▀░█▀▀░█░█░█▀▀░█▀▄[/bold magenta]
 [bold magenta]░█▀▀░█▀▀░█░█░█░█░░█░░█░█░░█░░░░░░█░░█▀█░█▀▀░█░░░█▀▄░█▀▀░█▀▄[/bold magenta]
 [bold magenta]░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░▀░▀░░▀░░▀▀▀░░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀░▀░▀▀▀░▀░▀[/bold magenta]
-[dim]Reputation Quick Check Tool v1.0  |  面向品牌咨询顾问[/dim]
+[dim]Reputation Quick Check Tool v2.0  |  双周期可比 · 离线样本库 · 模糊追问 · 多品牌对比[/dim]
     """
     console.print(banner)
 
@@ -313,6 +436,8 @@ def main():
 
     config = load_config(args.config)
 
+    use_library = not args.no_library
+
     if args.brand:
         params = build_query_params_from_args(args)
     else:
@@ -324,8 +449,23 @@ def main():
             sys.exit(1)
 
     console.print()
-    result = run_analysis(params, config)
 
+    if args.compare:
+        if not params.competing_brands:
+            console.print("[yellow]--compare 需要配合 --competitors 指定至少一个竞品[/yellow]")
+            sys.exit(1)
+        comp_result = run_batch_comparison(params, config, use_library=use_library)
+        report_gen = ReportGenerator(config=config)
+        report_gen.print_batch_comparison(comp_result)
+        if args.no_interactive:
+            return
+        dummy_result = list(comp_result.brand_results.values())[0] if comp_result.brand_results else None
+        if dummy_result:
+            if interactive_session(dummy_result, config, params):
+                pass
+            return
+
+    result, _ = run_analysis(params, config, use_library=use_library)
     report_gen = generate_report(result, config=config)
 
     if args.export is not None:
@@ -339,13 +479,13 @@ def main():
 
     try:
         while True:
-            should_restart = interactive_session(result, config)
+            should_restart = interactive_session(result, config, params)
             if not should_restart:
                 break
             console.clear()
             show_banner()
             params = build_query_params_interactive()
-            result = run_analysis(params, config)
+            result, _ = run_analysis(params, config, use_library=use_library)
             report_gen.print_full_report(result)
     except KeyboardInterrupt:
         console.print("\n\n[yellow]程序被中断，再见！[/yellow]")

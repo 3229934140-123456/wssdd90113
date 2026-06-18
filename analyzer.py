@@ -1,13 +1,18 @@
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
+import difflib
 import re
 
 from models import (
     Post, QueryParams, AnalysisResult, VolumeAnalysis,
     VolumeTrendPoint, ThemeAnalysis, ThemeKeyword, SentimentType,
-    ComplaintDetail, TimeRange
+    ComplaintDetail, TimeRange, ExpressionGroup, BatchComparisonResult,
+    BrandComparisonRow
 )
+
+
+FUZZY_MATCH_CUTOFF = 0.55
 
 
 class Analyzer:
@@ -218,24 +223,143 @@ class Analyzer:
 
         return selected
 
+    def _extract_tokens(self, text: str) -> List[str]:
+        tokens = set()
+        if not text:
+            return []
+        try:
+            import jieba
+            for t in jieba.cut(text):
+                if len(t) >= 2:
+                    tokens.add(t)
+        except Exception:
+            pass
+        for t in re.findall(r"[\u4e00-\u9fffA-Za-z]{2,}", text):
+            tokens.add(t)
+        if len(text) >= 2:
+            for i in range(len(text) - 1):
+                bigram = text[i:i + 2]
+                if re.match(r"[\u4e00-\u9fffA-Za-z]{2}", bigram):
+                    tokens.add(bigram)
+        return list(tokens)
+
+    def _fuzzy_find_keyword(
+        self,
+        query: str,
+        available_keywords: List[str],
+    ) -> Optional[str]:
+        if not query or not available_keywords:
+            return None
+        q = query.strip()
+        if not q:
+            return None
+
+        for kw in available_keywords:
+            if q == kw or q in kw or kw in q:
+                return kw
+
+        tokens = self._extract_tokens(q)
+        kw_tokens_map = {}
+        for kw in available_keywords:
+            kw_tokens_map[kw] = set(self._extract_tokens(kw))
+
+        best_match = None
+        best_score = 0.0
+        for kw in available_keywords:
+            score = difflib.SequenceMatcher(None, q, kw).ratio()
+            for tok in tokens:
+                if len(tok) >= 2 and (tok in kw or kw in tok):
+                    score = max(score, 0.7 + min(0.3, len(tok) / 10))
+            shared = set(tokens) & kw_tokens_map.get(kw, set())
+            if shared:
+                overlap_score = len(shared) / max(1, len(set(tokens) | kw_tokens_map.get(kw, set())))
+                score = max(score, 0.55 + overlap_score * 0.4)
+            if score > best_score and score >= FUZZY_MATCH_CUTOFF:
+                best_score = score
+                best_match = kw
+
+        return best_match
+
+    def _group_expressions(
+        self,
+        expressions: List[Tuple[str, int]],
+        max_groups: int = 5,
+    ) -> List[ExpressionGroup]:
+        if not expressions:
+            return []
+
+        groups: List[Dict] = []
+        for expr, cnt in expressions:
+            matched_group = None
+            clean_expr = re.sub(r"[，。！？、,.!?\s]+$", "", expr)
+            for g in groups:
+                existing = g["clean_sample"]
+                sim = difflib.SequenceMatcher(None, clean_expr, existing).ratio()
+                if sim >= 0.6:
+                    matched_group = g
+                    break
+            if matched_group is None:
+                groups.append({
+                    "key": clean_expr[:20] + ("…" if len(clean_expr) > 20 else ""),
+                    "count": cnt,
+                    "examples": [expr],
+                    "clean_sample": clean_expr,
+                })
+            else:
+                matched_group["count"] += cnt
+                if len(matched_group["examples"]) < 3:
+                    matched_group["examples"].append(expr)
+
+        groups.sort(key=lambda g: g["count"], reverse=True)
+        groups = groups[:max_groups]
+
+        result = []
+        for g in groups:
+            result.append(ExpressionGroup(
+                group_key=g["key"],
+                count=g["count"],
+                examples=g["examples"],
+            ))
+        return result
+
     def get_complaint_detail(
         self,
         keyword: str,
         analysis_result: AnalysisResult,
     ) -> ComplaintDetail:
-        if keyword in analysis_result.complaint_details_cache:
-            return analysis_result.complaint_details_cache[keyword]
+        cache_key = f"fuzzy::{keyword}"
+        if cache_key in analysis_result.complaint_details_cache:
+            return analysis_result.complaint_details_cache[cache_key]
+
+        ta = analysis_result.theme_analysis
+        available_keywords = [k.keyword for k in ta.complaints]
+
+        matched_kw = self._fuzzy_find_keyword(keyword, available_keywords)
+        if matched_kw is None:
+            for sentiment_list in [ta.advantages, ta.questions]:
+                kws = [k.keyword for k in sentiment_list]
+                matched_kw = self._fuzzy_find_keyword(keyword, kws)
+                if matched_kw:
+                    break
+
+        search_kw = matched_kw if matched_kw else keyword
 
         posts = analysis_result.all_posts
-        matched_posts = [
-            p for p in posts
-            if p.sentiment == SentimentType.NEGATIVE and any(
-                keyword in kw or kw in keyword for kw in p.keywords
-            )
-        ]
+        matched_posts: List[Post] = []
+        for p in posts:
+            matched = False
+            for kw in p.keywords:
+                if search_kw == kw or search_kw in kw or kw in search_kw:
+                    matched = True
+                    break
+            if not matched and len(search_kw) >= 2 and search_kw in (p.title + p.content):
+                matched = True
+            if matched:
+                matched_posts.append(p)
 
         detail = ComplaintDetail(
             complaint_keyword=keyword,
+            matched_keyword=matched_kw or keyword,
             total_mentions=len(matched_posts),
             related_posts=matched_posts,
         )
@@ -262,7 +386,8 @@ class Analyzer:
                     if quote and quote not in detail.official_response_examples:
                         detail.official_response_examples.append(quote)
 
-        detail.typical_expressions = expression_counter.most_common(8)
+        detail.typical_expressions = expression_counter.most_common(12)
+        detail.grouped_expressions = self._group_expressions(detail.typical_expressions)
         detail.source_distribution = dict(source_counter.most_common())
         detail.is_competitor_troll = troll_count > 0
         if competitor_brands:
@@ -287,8 +412,98 @@ class Analyzer:
         else:
             detail.frequency_trend = "数据不足"
 
-        analysis_result.complaint_details_cache[keyword] = detail
+        analysis_result.complaint_details_cache[cache_key] = detail
         return detail
+
+    def compare_brands(
+        self,
+        all_posts: List[Post],
+        target_brand: str,
+        competing_brands: List[str],
+        time_range: Optional[TimeRange],
+    ) -> BatchComparisonResult:
+        brands = [target_brand] + list(competing_brands)
+        result = BatchComparisonResult(
+            brands=brands,
+            target_brand=target_brand,
+            time_range=time_range,
+            generated_at=datetime.now(),
+        )
+
+        for brand in brands:
+            brand_posts = [p for p in all_posts if p.brand == brand]
+            row = BrandComparisonRow(
+                brand=brand,
+                is_target=(brand == target_brand),
+            )
+
+            if time_range:
+                in_range = [
+                    p for p in brand_posts
+                    if p.publish_time and time_range.start_date <= p.publish_time <= time_range.end_date
+                ]
+                range_days = max(1, (time_range.end_date - time_range.start_date).days)
+                prev_start = time_range.start_date - timedelta(days=range_days)
+                prev_end = time_range.start_date - timedelta(seconds=1)
+                prev_in_range = [
+                    p for p in brand_posts
+                    if p.publish_time and prev_start <= p.publish_time <= prev_end
+                ]
+            else:
+                in_range = brand_posts
+                prev_in_range = []
+
+            row.total_posts = len(in_range)
+            if row.total_posts > 0:
+                row.negative_ratio = sum(1 for p in in_range if p.sentiment == SentimentType.NEGATIVE) / row.total_posts * 100
+            if prev_in_range:
+                row.volume_change_rate = (row.total_posts - len(prev_in_range)) / len(prev_in_range) * 100
+
+            comp_counter: Counter = Counter()
+            adv_counter: Counter = Counter()
+            troll_posts = 0
+            official_resp_posts = 0
+            for p in in_range:
+                for kw in p.keywords:
+                    if p.sentiment == SentimentType.NEGATIVE:
+                        comp_counter[kw] += 1
+                    elif p.sentiment == SentimentType.POSITIVE:
+                        adv_counter[kw] += 1
+                if p.is_competing_brand_troll:
+                    troll_posts += 1
+                if p.has_official_response:
+                    official_resp_posts += 1
+
+            if comp_counter:
+                top = comp_counter.most_common(1)[0]
+                row.top_complaint = top[0]
+                row.top_complaint_count = top[1]
+            if adv_counter:
+                top = adv_counter.most_common(1)[0]
+                row.top_advantage = top[0]
+                row.top_advantage_count = top[1]
+
+            row.troll_ratio = troll_posts / row.total_posts * 100 if row.total_posts > 0 else 0.0
+            row.official_response_ratio = official_resp_posts / max(1, sum(1 for p in in_range if p.sentiment == SentimentType.NEGATIVE)) * 100
+
+            risk = 0
+            if row.negative_ratio > 50:
+                risk += 2
+            elif row.negative_ratio > 35:
+                risk += 1
+            if row.volume_change_rate > 30:
+                risk += 1
+            if row.troll_ratio > 30:
+                risk += 1
+            if row.top_complaint_count >= max(3, row.total_posts * 0.2):
+                risk += 1
+            if row.official_response_ratio < 15 and row.negative_ratio > 30:
+                risk += 1
+            row.risk_score = risk
+
+            result.rows.append(row)
+
+        return result
 
 
 def analyze(posts: List[Post], params: QueryParams, config: Optional[Dict] = None) -> AnalysisResult:
