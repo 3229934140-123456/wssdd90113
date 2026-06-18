@@ -361,7 +361,16 @@ class Analyzer:
 
         search_kw = matched_kw if matched_kw else keyword
 
-        posts = analysis_result.current_range_posts or analysis_result.all_posts
+        posts = analysis_result.current_range_posts
+        if not posts:
+            empty_detail = ComplaintDetail(
+                complaint_keyword=keyword,
+                matched_keyword=matched_kw or keyword,
+                total_mentions=0,
+                frequency_trend="当前范围暂无提及",
+            )
+            analysis_result.complaint_details_cache[cache_key] = empty_detail
+            return empty_detail
         matched_posts: List[Post] = []
         for p in posts:
             matched = False
@@ -517,6 +526,13 @@ class Analyzer:
             if row.official_response_ratio < 15 and row.negative_ratio > 30:
                 risk += 1
             row.risk_score = risk
+
+            evidence_candidates = sorted(
+                in_range,
+                key=lambda p: (p.likes * 2 + p.comments_count * 5 + min(p.views // 100, 100)),
+                reverse=True,
+            )
+            row.evidence_posts = evidence_candidates[:3]
 
             result.rows.append(row)
 

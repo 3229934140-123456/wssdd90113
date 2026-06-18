@@ -14,7 +14,7 @@ from models import (
     AnalysisResult, SentimentType, MeetingMinutes,
     MeetingMinutesItem, TrackingIssue, InterviewDirection,
     ComplaintDetail, VolumeTrendPoint, BatchComparisonResult,
-    BrandComparisonRow
+    BrandComparisonRow, ResearchProject
 )
 from analyzer import Analyzer
 
@@ -227,6 +227,15 @@ class ReportGenerator:
             border_style="bold red",
             expand=True
         ))
+
+        if detail.total_mentions == 0 and detail.frequency_trend == "当前范围暂无提及":
+            console.print(Panel(
+                f"[yellow]当前时间范围内暂无「{keyword}」的相关提及。[/yellow]\n"
+                "[dim]上一周期数据仅用于环比参考，不计入当前结论。[/dim]",
+                border_style="yellow",
+                expand=True,
+            ))
+            return
 
         info_table = Table(show_header=False, box=box.SIMPLE, expand=True)
         info_table.add_column("项目", style="bold")
@@ -471,6 +480,8 @@ class ReportGenerator:
             analyzer = Analyzer(self.config)
             for comp in ta.complaints[:5]:
                 detail = analyzer.get_complaint_detail(comp.keyword, result)
+                if detail.total_mentions == 0 and detail.frequency_trend == "当前范围暂无提及":
+                    continue
                 priority = "高" if detail.frequency_trend in ("骤升", "上升") or detail.troll_ratio > 30 else "中"
                 if detail.total_mentions < 3:
                     priority = "低"
@@ -690,7 +701,25 @@ class ReportGenerator:
 
         lines.append("")
         lines.append("-" * 70)
-        lines.append("【三、总结】")
+        lines.append("【四、证据附录】")
+        lines.append("-" * 70)
+        for r in sorted_rows:
+            marker = "★ " if r.is_target else "  "
+            if r.evidence_posts:
+                lines.append("")
+                lines.append(f"{marker}{r.brand} - 可引用原帖:")
+                for ep in r.evidence_posts[:3]:
+                    time_str = ep.publish_time.strftime("%Y-%m-%d %H:%M") if ep.publish_time else "时间未知"
+                    source_str = ep.source or "未知来源"
+                    summary_text = ep.summary or ep.content[:60]
+                    lines.append(f"  · [{source_str} | {time_str}]「{summary_text}」")
+            else:
+                lines.append("")
+                lines.append(f"{marker}{r.brand} - 暂无可引用原帖")
+        lines.append("")
+
+        lines.append("-" * 70)
+        lines.append("【五、总结】")
         lines.append("-" * 70)
         target_row = next((r for r in comp.rows if r.is_target), None)
         if target_row:
@@ -726,3 +755,112 @@ def generate_report(result: AnalysisResult, config: Optional[Dict] = None):
     gen = ReportGenerator(config=config)
     gen.print_full_report(result)
     return gen
+
+
+def build_project_progress_minutes(project: ResearchProject) -> str:
+    lines: List[str] = []
+    lines.append("=" * 70)
+    lines.append(f"  调研项目进展纪要 - {project.name}")
+    lines.append("=" * 70)
+    lines.append("")
+    lines.append(f"项目ID  : {project.project_id}")
+    lines.append(f"创建时间: {project.created_at.strftime('%Y-%m-%d %H:%M')}")
+    lines.append(f"最近更新: {project.updated_at.strftime('%Y-%m-%d %H:%M')}")
+    params = project.query_params
+    lines.append(f"目标品牌: {params.target_brand}")
+    if params.competing_brands:
+        lines.append(f"对比竞品: {', '.join(params.competing_brands)}")
+    if params.time_range:
+        lines.append(f"时间范围: {params.time_range}")
+    if params.focus_themes:
+        lines.append(f"关注主题: {', '.join(params.focus_themes)}")
+    lines.append("")
+
+    lines.append("-" * 70)
+    lines.append("【一、查询快照（按时间排列）】")
+    lines.append("-" * 70)
+    if project.query_snapshots:
+        for i, snap in enumerate(project.query_snapshots, 1):
+            lines.append(f"  [{i}] {snap.created_at.strftime('%Y-%m-%d %H:%M')}")
+            sp = snap.query_params
+            lines.append(f"      品牌: {sp.target_brand}  竞品: {', '.join(sp.competing_brands) or '-'}")
+            if sp.time_range:
+                lines.append(f"      时间: {sp.time_range}")
+            if sp.focus_themes:
+                lines.append(f"      主题: {', '.join(sp.focus_themes)}")
+            summary = snap.result_summary
+            if summary:
+                if "current_posts" in summary:
+                    lines.append(f"      当前周期帖数: {summary['current_posts']}")
+                if "negative_ratio" in summary:
+                    lines.append(f"      负面占比: {summary['negative_ratio']:.1f}%")
+                if "top_complaint" in summary:
+                    lines.append(f"      主要槽点: {summary['top_complaint']}")
+                if "volume_change" in summary:
+                    lines.append(f"      讨论量环比: {summary['volume_change']:+.1f}%")
+            if snap.notes:
+                lines.append(f"      备注: {snap.notes}")
+    else:
+        lines.append("  （暂无查询快照）")
+    lines.append("")
+
+    lines.append("-" * 70)
+    lines.append("【二、追问记录】")
+    lines.append("-" * 70)
+    if project.follow_up_history:
+        for f in project.follow_up_history:
+            lines.append(f"  · [{f.created_at.strftime('%m-%d %H:%M')}]「{f.query}」→ {f.matched_keyword}（{f.total_mentions}次）")
+    else:
+        lines.append("  （暂无追问记录）")
+    lines.append("")
+
+    lines.append("-" * 70)
+    lines.append("【三、导出纪要记录】")
+    lines.append("-" * 70)
+    if project.exported_minutes_paths:
+        lines.append("  会议纪要:")
+        for p in project.exported_minutes_paths:
+            lines.append(f"    · {p}")
+    if project.exported_comparison_paths:
+        lines.append("  对比纪要:")
+        for p in project.exported_comparison_paths:
+            lines.append(f"    · {p}")
+    if not project.exported_minutes_paths and not project.exported_comparison_paths:
+        lines.append("  （暂无导出纪要）")
+    lines.append("")
+
+    if project.query_snapshots and len(project.query_snapshots) >= 2:
+        lines.append("-" * 70)
+        lines.append("【四、口碑变化趋势（跨快照对比）】")
+        lines.append("-" * 70)
+        for i in range(1, len(project.query_snapshots)):
+            prev = project.query_snapshots[i - 1]
+            curr = project.query_snapshots[i]
+            prev_neg = prev.result_summary.get("negative_ratio", 0)
+            curr_neg = curr.result_summary.get("negative_ratio", 0)
+            delta = curr_neg - prev_neg
+            arrow = "↑" if delta > 0 else "↓" if delta < 0 else "→"
+            lines.append(f"  {prev.created_at.strftime('%m-%d %H:%M')} → {curr.created_at.strftime('%m-%d %H:%M')}")
+            lines.append(f"    负面占比: {prev_neg:.1f}% → {curr_neg:.1f}% ({arrow}{delta:+.1f}百分点)")
+            prev_comp = prev.result_summary.get("top_complaint", "")
+            curr_comp = curr.result_summary.get("top_complaint", "")
+            if prev_comp or curr_comp:
+                lines.append(f"    主要槽点: {prev_comp or '-'} → {curr_comp or '-'}")
+        lines.append("")
+
+    lines.append("=" * 70)
+    return "\n".join(lines)
+
+
+def export_project_progress_minutes(
+    project: ResearchProject,
+    output_dir: Optional[str] = None,
+) -> str:
+    odir = output_dir or "./reports"
+    os.makedirs(odir, exist_ok=True)
+    filename = f"项目进展_{project.name}_{project.updated_at.strftime('%Y%m%d_%H%M%S')}.txt"
+    filepath = os.path.join(odir, filename)
+    content = build_project_progress_minutes(project)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+    return filepath

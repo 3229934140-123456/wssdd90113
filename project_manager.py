@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import List, Optional, Dict
 
 from models import (
-    ResearchProject, QueryParams, FollowUpRecord,
+    ResearchProject, QueryParams, FollowUpRecord, QuerySnapshot,
     MeetingMinutes, BatchComparisonResult
 )
 
@@ -53,6 +53,9 @@ class ProjectManager:
                 }
                 for f in p.follow_up_history
             ],
+            "query_snapshots": [
+                self._serialize_snapshot(s) for s in p.query_snapshots
+            ],
             "notes": p.notes,
         }
 
@@ -92,6 +95,9 @@ class ProjectManager:
             exported_minutes_paths=list(data.get("exported_minutes_paths", [])),
             exported_comparison_paths=list(data.get("exported_comparison_paths", [])),
             follow_up_history=follow_ups,
+            query_snapshots=[
+                self._deserialize_snapshot(s) for s in data.get("query_snapshots", [])
+            ],
             notes=data.get("notes", ""),
         )
 
@@ -108,6 +114,69 @@ class ProjectManager:
         )
         self.save_project(project)
         return project
+
+    def _serialize_snapshot(self, s: QuerySnapshot) -> Dict:
+        tr = None
+        if s.query_params.time_range:
+            tr = {
+                "start": s.query_params.time_range.start_date.isoformat(),
+                "end": s.query_params.time_range.end_date.isoformat(),
+            }
+        return {
+            "snapshot_id": s.snapshot_id,
+            "query_params": {
+                "target_brand": s.query_params.target_brand,
+                "competing_brands": s.query_params.competing_brands,
+                "time_range": tr,
+                "focus_themes": s.query_params.focus_themes,
+                "data_sources": s.query_params.data_sources,
+            },
+            "result_summary": s.result_summary,
+            "created_at": s.created_at.isoformat(),
+            "notes": s.notes,
+        }
+
+    def _deserialize_snapshot(self, data: Dict) -> QuerySnapshot:
+        qp = data["query_params"]
+        tr = None
+        if qp.get("time_range"):
+            from models import TimeRange
+            tr_data = qp["time_range"]
+            tr = TimeRange(
+                start_date=datetime.fromisoformat(tr_data["start"]),
+                end_date=datetime.fromisoformat(tr_data["end"]),
+            )
+        params = QueryParams(
+            target_brand=qp["target_brand"],
+            competing_brands=list(qp.get("competing_brands", [])),
+            time_range=tr,
+            focus_themes=list(qp.get("focus_themes", [])),
+            data_sources=list(qp.get("data_sources", [])),
+        )
+        return QuerySnapshot(
+            snapshot_id=data["snapshot_id"],
+            query_params=params,
+            result_summary=data.get("result_summary", {}),
+            created_at=datetime.fromisoformat(data["created_at"]),
+            notes=data.get("notes", ""),
+        )
+
+    def add_query_snapshot(
+        self,
+        project: ResearchProject,
+        params: QueryParams,
+        result_summary: Dict,
+        notes: str = "",
+    ) -> QuerySnapshot:
+        snapshot = QuerySnapshot(
+            snapshot_id=uuid.uuid4().hex[:8],
+            query_params=params,
+            result_summary=result_summary,
+            notes=notes,
+        )
+        project.query_snapshots.append(snapshot)
+        self.save_project(project)
+        return snapshot
 
     def save_project(self, project: ResearchProject) -> None:
         project.updated_at = datetime.now()

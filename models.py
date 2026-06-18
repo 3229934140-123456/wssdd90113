@@ -198,6 +198,7 @@ class BrandComparisonRow:
     troll_ratio: float = 0.0
     official_response_ratio: float = 0.0
     risk_score: int = 0
+    evidence_posts: List[Post] = field(default_factory=list)
 
 
 @dataclass
@@ -208,6 +209,15 @@ class BatchComparisonResult:
     rows: List[BrandComparisonRow] = field(default_factory=list)
     generated_at: datetime = field(default_factory=datetime.now)
     brand_results: Dict[str, AnalysisResult] = field(default_factory=dict)
+
+
+@dataclass
+class QuerySnapshot:
+    snapshot_id: str
+    query_params: QueryParams
+    result_summary: Dict = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.now)
+    notes: str = ""
 
 
 @dataclass
@@ -229,4 +239,5 @@ class ResearchProject:
     exported_minutes_paths: List[str] = field(default_factory=list)
     exported_comparison_paths: List[str] = field(default_factory=list)
     follow_up_history: List[FollowUpRecord] = field(default_factory=list)
+    query_snapshots: List[QuerySnapshot] = field(default_factory=list)
     notes: str = ""

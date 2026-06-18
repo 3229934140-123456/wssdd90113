@@ -352,6 +352,59 @@ class DataSourceSimulator:
             )
             return posts_sorted[:n]
 
+        def _stable_sort_and_trim_by_period(
+            posts: List[Post],
+            n: int,
+            time_range: TimeRange,
+        ) -> List[Post]:
+            current_period = [
+                p for p in posts
+                if p.publish_time and time_range.start_date <= p.publish_time <= time_range.end_date
+            ]
+            range_days = max(1, (time_range.end_date - time_range.start_date).days)
+            prev_start = time_range.start_date - timedelta(days=range_days)
+            prev_end = time_range.start_date - timedelta(seconds=1)
+            previous_period = [
+                p for p in posts
+                if p.publish_time and prev_start <= p.publish_time <= prev_end
+            ]
+            other_period = [p for p in posts if p not in current_period and p not in previous_period]
+            current_sorted = sorted(
+                current_period,
+                key=lambda p: (p.publish_time.isoformat() if p.publish_time else "", p.post_id or ""),
+                reverse=True,
+            )
+            previous_sorted = sorted(
+                previous_period,
+                key=lambda p: (p.publish_time.isoformat() if p.publish_time else "", p.post_id or ""),
+                reverse=True,
+            )
+            if not current_period and not previous_period:
+                other_sorted = sorted(
+                    other_period,
+                    key=lambda p: (p.publish_time.isoformat() if p.publish_time else "", p.post_id or ""),
+                    reverse=True,
+                )
+                return other_sorted[:n]
+            curr_quota = int(n * 0.55)
+            prev_quota = n - curr_quota
+            if len(current_sorted) < curr_quota:
+                leftover = curr_quota - len(current_sorted)
+                prev_quota += leftover
+            elif len(previous_sorted) < prev_quota:
+                leftover = prev_quota - len(previous_sorted)
+                curr_quota += leftover
+            result = current_sorted[:curr_quota] + previous_sorted[:prev_quota]
+            remaining = n - len(result)
+            if remaining > 0 and other_period:
+                other_sorted = sorted(
+                    other_period,
+                    key=lambda p: (p.publish_time.isoformat() if p.publish_time else "", p.post_id or ""),
+                    reverse=True,
+                )
+                result.extend(other_sorted[:remaining])
+            return result
+
         if use_library and mode != "resample":
             if library is None:
                 library = get_library()
@@ -371,12 +424,18 @@ class DataSourceSimulator:
             existing_for_brand = [p for p in all_posts if p.brand == brand]
             if mode == "reuse":
                 all_posts = [p for p in all_posts if p.brand != brand]
-                all_posts.extend(_stable_sort_and_trim(existing_for_brand, desired_count))
+                if time_range and existing_for_brand:
+                    all_posts.extend(_stable_sort_and_trim_by_period(existing_for_brand, desired_count, time_range))
+                else:
+                    all_posts.extend(_stable_sort_and_trim(existing_for_brand, desired_count))
                 continue
 
             if len(existing_for_brand) >= desired_count and mode == "smart":
                 all_posts = [p for p in all_posts if p.brand != brand]
-                all_posts.extend(_stable_sort_and_trim(existing_for_brand, desired_count))
+                if time_range and existing_for_brand:
+                    all_posts.extend(_stable_sort_and_trim_by_period(existing_for_brand, desired_count, time_range))
+                else:
+                    all_posts.extend(_stable_sort_and_trim(existing_for_brand, desired_count))
                 continue
 
             need_count = max(0, desired_count - len(existing_for_brand))

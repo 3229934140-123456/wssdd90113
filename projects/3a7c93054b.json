@@ -1,0 +1,27 @@
+{
+  "project_id": "3a7c93054b",
+  "name": "小米Q2调研v4",
+  "query_params": {
+    "target_brand": "小米手机",
+    "competing_brands": [
+      "华为手机",
+      "苹果手机"
+    ],
+    "time_range": {
+      "start": "2026-05-20T23:59:59.425940",
+      "end": "2026-06-19T23:59:59.425940"
+    },
+    "focus_themes": [],
+    "data_sources": []
+  },
+  "created_at": "2026-06-19T05:36:40.426289",
+  "updated_at": "2026-06-19T05:36:40.528703",
+  "latest_analysis_ref": "",
+  "exported_minutes_paths": [],
+  "exported_comparison_paths": [
+    "D:\\trae-bz\\TraeProjects\\90113\\reports\\对比纪要_小米手机_20260619_053640.txt"
+  ],
+  "follow_up_history": [],
+  "query_snapshots": [],
+  "notes": ""
+}

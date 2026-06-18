@@ -25,12 +25,28 @@ from models import (
 )
 from data_source import fetch_posts_with_library
 from analyzer import analyze, Analyzer
-from report_generator import ReportGenerator, generate_report
+from report_generator import ReportGenerator, generate_report, export_project_progress_minutes
 from sample_library import get_library, SampleLibrary
 from project_manager import get_project_manager, ProjectManager
 
 
 console = Console()
+
+
+def _extract_result_summary(result: AnalysisResult) -> dict:
+    va = result.volume_analysis
+    ta = result.theme_analysis
+    summary = {
+        "current_posts": va.time_range_posts,
+        "previous_posts": va.previous_range_posts,
+        "volume_change": va.volume_change_rate,
+        "negative_ratio": va.negative_ratio,
+    }
+    if ta.complaints:
+        summary["top_complaint"] = f"{ta.complaints[0].keyword}({ta.complaints[0].count}次)"
+    if ta.advantages:
+        summary["top_advantage"] = f"{ta.advantages[0].keyword}({ta.advantages[0].count}次)"
+    return summary
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -158,6 +174,7 @@ def run_analysis(
     config: dict,
     use_library: bool = True,
     library_mode: str = "smart",
+    project: Optional[ResearchProject] = None,
 ) -> Tuple[AnalysisResult, dict]:
     library = get_library() if use_library else None
 
@@ -178,6 +195,11 @@ def run_analysis(
         if lib_stats.get("saved", 0) > 0:
             hint_parts.append(f"已入库 {lib_stats['saved']} 条")
         console.print(f"  [dim]📚 {' | '.join(hint_parts)}[/dim]")
+
+    if project:
+        pm = get_project_manager()
+        result_summary = _extract_result_summary(result)
+        pm.add_query_snapshot(project, params, result_summary)
 
     return result, lib_stats
 
@@ -289,25 +311,50 @@ def print_project_detail(project: ResearchProject):
         f"[bold]关注主题:[/bold] {', '.join(project.query_params.focus_themes) or '-'}\n"
         f"[bold]创建时间:[/bold] {project.created_at.strftime('%Y-%m-%d %H:%M')}\n"
         f"[bold]最近更新:[/bold] {project.updated_at.strftime('%Y-%m-%d %H:%M')}\n"
+        f"[bold]查询快照:[/bold] {len(project.query_snapshots)} 次\n"
         f"[bold]追问历史:[/bold] {len(project.follow_up_history)} 条\n"
         f"[bold]导出纪要:[/bold] {len(project.exported_minutes_paths)} 份\n"
         f"[bold]导出对比:[/bold] {len(project.exported_comparison_paths)} 份",
-        title="[bold cyan]项目详情[/bold cyan]",
+        title="[bold cyan]项目总览[/bold cyan]",
         border_style="cyan",
         expand=False,
     ))
+
+    if project.query_snapshots:
+        console.print(f"\n[bold]查询快照（按时间排列）:[/bold]")
+        snap_table = Table(box=box.MINIMAL, show_lines=False)
+        snap_table.add_column("#", justify="right", style="dim")
+        snap_table.add_column("时间", style="cyan")
+        snap_table.add_column("品牌", style="bold")
+        snap_table.add_column("当前帖数", justify="right")
+        snap_table.add_column("负面占比", justify="right", style="red")
+        snap_table.add_column("主要槽点", style="yellow")
+        for i, snap in enumerate(project.query_snapshots, 1):
+            s = snap.result_summary
+            snap_table.add_row(
+                str(i),
+                snap.created_at.strftime("%m-%d %H:%M"),
+                snap.query_params.target_brand,
+                str(s.get("current_posts", "-")),
+                f"{s.get('negative_ratio', 0):.1f}%" if "negative_ratio" in s else "-",
+                s.get("top_complaint", "-"),
+            )
+        console.print(snap_table)
+
     if project.follow_up_history:
         console.print(f"\n[bold]最近追问:[/bold]")
         for f in project.follow_up_history[-5:]:
             console.print(f"  • 「{f.query}」→ {f.matched_keyword}（{f.total_mentions}次） {f.created_at.strftime('%m-%d %H:%M')}")
-    if project.exported_minutes_paths:
-        console.print(f"\n[bold]最近导出会议纪要:[/bold]")
+
+    if project.exported_minutes_paths or project.exported_comparison_paths:
+        console.print(f"\n[bold]导出纪要:[/bold]")
         for p in project.exported_minutes_paths[-3:]:
-            console.print(f"  • {p}")
-    if project.exported_comparison_paths:
-        console.print(f"\n[bold]最近导出对比纪要:[/bold]")
+            console.print(f"  📄 会议: {p}")
         for p in project.exported_comparison_paths[-3:]:
-            console.print(f"  • {p}")
+            console.print(f"  📊 对比: {p}")
+
+    if project.query_params:
+        console.print(f"\n[dim]提示: 输入「继续」可基于上次参数（{project.query_params.target_brand}、{project.query_params.time_range}）重新查询[/dim]")
 
 
 def interactive_session(
@@ -338,7 +385,10 @@ def interactive_session(
         "  [cyan]项目|projects[/cyan]         列出所有调研项目\n"
         "  [cyan]新建项目 <名>[/cyan]         基于当前查询创建新项目\n"
         "  [cyan]打开项目 <ID>[/cyan]         打开已有项目续查\n"
-        "  [cyan]项目详情[/cyan]              查看当前项目详细信息\n"
+        "  [cyan]项目详情|项目总览[/cyan]     查看当前项目总览（快照/追问/纪要）\n"
+        "  [cyan]快照[/cyan]                    查看当前项目的查询快照列表\n"
+        "  [cyan]继续[/cyan]                    基于当前项目参数重新查询\n"
+        "  [cyan]导出进展[/cyan]              导出项目进展纪要\n"
         "  [cyan]新查询[/cyan]                  开始新一轮调研\n"
         "  [cyan]退出[/cyan]                    退出程序"
         + project_note + mode_note,
@@ -521,14 +571,72 @@ def interactive_session(
             if Confirm.ask(f"是否加载项目「{project.name}」并基于其参数重新分析？", default=True):
                 params = project.query_params
                 with console.status("[bold green]正在基于项目参数重新分析...[/bold green]"):
-                    result, _ = run_analysis(params, config, use_library=use_library, library_mode="reuse")
+                    result, _ = run_analysis(params, config, use_library=use_library, library_mode="reuse", project=project)
                 report_gen.print_full_report(result)
 
-        elif cmd_lower in ["项目详情", "projectinfo"]:
+        elif cmd_lower in ["项目详情", "项目总览", "projectinfo"]:
             if not project:
                 console.print("[yellow]当前没有关联项目，使用「新建项目」创建或「打开项目」加载。[/yellow]")
             else:
+                project = pm.load_project(project.project_id)
                 print_project_detail(project)
+
+        elif cmd_lower in ["快照", "snapshots"]:
+            if not project:
+                console.print("[yellow]当前没有关联项目。[/yellow]")
+            else:
+                project = pm.load_project(project.project_id)
+                if not project.query_snapshots:
+                    console.print("[dim]当前项目暂无查询快照，执行查询后会自动记录。[/dim]")
+                else:
+                    console.print(f"\n[bold cyan]📋 查询快照（共 {len(project.query_snapshots)} 次）:[/bold cyan]")
+                    snap_table = Table(box=box.MINIMAL, show_lines=False)
+                    snap_table.add_column("#", justify="right", style="dim")
+                    snap_table.add_column("时间", style="cyan")
+                    snap_table.add_column("品牌", style="bold")
+                    snap_table.add_column("竞品", style="dim")
+                    snap_table.add_column("时间范围")
+                    snap_table.add_column("当前帖数", justify="right")
+                    snap_table.add_column("负面占比", justify="right", style="red")
+                    snap_table.add_column("主要槽点", style="yellow")
+                    snap_table.add_column("环比", justify="right")
+                    for i, snap in enumerate(project.query_snapshots, 1):
+                        s = snap.result_summary
+                        snap_table.add_row(
+                            str(i),
+                            snap.created_at.strftime("%m-%d %H:%M"),
+                            snap.query_params.target_brand,
+                            ", ".join(snap.query_params.competing_brands[:2]) or "-",
+                            str(snap.query_params.time_range) if snap.query_params.time_range else "-",
+                            str(s.get("current_posts", "-")),
+                            f"{s.get('negative_ratio', 0):.1f}%" if "negative_ratio" in s else "-",
+                            s.get("top_complaint", "-"),
+                            f"{s.get('volume_change', 0):+.1f}%" if "volume_change" in s else "-",
+                        )
+                    console.print(snap_table)
+
+        elif cmd_lower in ["继续", "continue", "resume"]:
+            if not project:
+                console.print("[yellow]当前没有关联项目，请先「新建项目」或「打开项目」。[/yellow]")
+                continue
+            project = pm.load_project(project.project_id)
+            params = project.query_params
+            console.print(f"[cyan]基于项目参数重新查询: {params.target_brand}，{params.time_range}[/cyan]")
+            with console.status("[bold green]正在重新分析...[/bold green]"):
+                result, _ = run_analysis(params, config, use_library=use_library, library_mode=library_mode, project=project)
+            report_gen.print_full_report(result)
+
+        elif cmd_lower in ["导出进展", "exportprogress"]:
+            if not project:
+                console.print("[yellow]当前没有关联项目。[/yellow]")
+                continue
+            project = pm.load_project(project.project_id)
+            default_dir = config.get("output", {}).get("default_dir", "./reports")
+            output_dir = Prompt.ask("保存目录", default=default_dir)
+            with console.status("[bold green]正在生成项目进展纪要...[/bold green]"):
+                filepath = export_project_progress_minutes(project, output_dir=output_dir)
+            console.print(f"\n[bold green]✓ 项目进展纪要已保存:[/bold green] [underline]{os.path.abspath(filepath)}[/underline]")
+            pm.add_exported_minutes(project, os.path.abspath(filepath))
 
         elif cmd_lower in ["新查询", "new", "reset", "n"]:
             if Confirm.ask("确定要开始新一轮查询吗？", default=True):
@@ -542,14 +650,17 @@ def interactive_session(
                 "  [cyan]重绘[/cyan]               重新显示完整三段式报告\n"
                 "  [cyan]对比[/cyan]               目标品牌 vs 多竞品批量对照摘要\n"
                 "  [cyan]导出[/cyan]               保存会议纪要 TXT\n"
-                "  [cyan]导出对比[/cyan]           保存客户版对比纪要（会前分发用）\n"
+                "  [cyan]导出对比[/cyan]           保存客户版对比纪要（会前分发用，含证据附录）\n"
+                "  [cyan]导出进展[/cyan]           保存项目进展纪要（含快照对比趋势）\n"
                 "  [cyan]模式 <策略>[/cyan]       smart/reuse/resample 样本策略切换\n"
                 "  [cyan]样本库[/cyan]             查看离线样本库累计数据量\n"
                 "  [cyan]清空 <品牌>[/cyan]       清除某品牌的样本库数据\n"
                 "  [cyan]项目[/cyan]               列出所有调研项目\n"
                 "  [cyan]新建项目 <名>[/cyan]    创建新项目，绑定当前查询\n"
                 "  [cyan]打开项目 <ID>[/cyan]    加载已有项目并复用其参数\n"
-                "  [cyan]项目详情[/cyan]           查看当前项目详情\n"
+                "  [cyan]项目详情|项目总览[/cyan] 查看当前项目总览（快照/追问/纪要）\n"
+                "  [cyan]快照[/cyan]               查看当前项目的查询快照列表\n"
+                "  [cyan]继续[/cyan]               基于当前项目参数重新查询\n"
                 "  [cyan]新查询[/cyan]             开始新一轮调研\n"
                 "  [cyan]帮助[/cyan]               显示本帮助\n"
                 "  [cyan]退出[/cyan]               退出程序",
@@ -565,14 +676,14 @@ def interactive_session(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="reputation_checker",
-        description="品牌口碑速查工具 v3 - 面向品牌咨询顾问的论坛声音速查",
+        description="品牌口碑速查工具 v4 - 面向品牌咨询顾问的论坛声音速查",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-v3 更新内容:
-  · 口径纯净：优点/槽点/疑问/代表帖/追问 仅基于当前时间周期，上一周期仅用于环比
-  · 样本稳定：支持 smart/reuse/resample 三种样本策略，同查询结果可重现
-  · 项目管理：创建/打开调研项目，追问记录与导出纪要统一归档
-  · 客户版对比纪要：按品牌结构化导出（负面占比/槽点/带节奏/官方响应/建议动作）
+v4 更新内容:
+  · 项目沉淀：查询快照自动记录，项目总览展示，继续查询，项目进展纪要导出
+  · 样本复核：reuse模式按当前/上一周期比例分配截断，补采样后切换reuse双周期样本稳定
+  · 口径纯净：当前范围无帖子时追问显示暂无提及，不拿上周期凑数
+  · 证据附录：对比纪要每品牌附可引用原帖摘要+来源时间
 
 示例:
   python main.py --brand 小米手机 --competitors 华为手机,苹果手机 --days 30 --themes 售后,新品,涨价
@@ -602,7 +713,7 @@ def show_banner():
 [bold magenta]░█▀█░█▀▀░█▀█░█░█░▀█▀░█▀█░▀█▀░░░░░█▀▀░█░█░█▀▀░█▀▀░█░█░█▀▀░█▀▄[/bold magenta]
 [bold magenta]░█▀▀░█▀▀░█░█░█░█░░█░░█░█░░█░░░░░░█░░█▀█░█▀▀░█░░░█▀▄░█▀▀░█▀▄[/bold magenta]
 [bold magenta]░▀░░░▀▀▀░▀░▀░▀▀▀░░▀░░▀░▀░░▀░░▀▀▀░░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀░▀░▀▀▀░▀░▀[/bold magenta]
-[dim]Reputation Quick Check Tool v3.0  |  口径纯净 · 样本稳定 · 项目管理 · 客户版纪要[/dim]
+[dim]Reputation Quick Check Tool v4.0  |  项目沉淀 · 样本复核 · 口径纯净 · 证据附录[/dim]
     """
     console.print(banner)
 
@@ -663,7 +774,7 @@ def main():
                 pass
             return
 
-    result, _ = run_analysis(params, config, use_library=use_library, library_mode=library_mode)
+    result, _ = run_analysis(params, config, use_library=use_library, library_mode=library_mode, project=project)
     report_gen = generate_report(result, config=config)
 
     if args.export is not None:
@@ -692,7 +803,7 @@ def main():
             console.clear()
             show_banner()
             params = build_query_params_interactive()
-            result, _ = run_analysis(params, config, use_library=use_library, library_mode=library_mode)
+            result, _ = run_analysis(params, config, use_library=use_library, library_mode=library_mode, project=project)
             report_gen.print_full_report(result)
     except KeyboardInterrupt:
         console.print("\n\n[yellow]程序被中断，再见！[/yellow]")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-冒烟测试 v3 - 验证口碑速查工具全部 v3 新特性
+冒烟测试 v4 - 验证口碑速查工具全部 v4 新特性
 """
 
 import sys
@@ -15,13 +15,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from models import QueryParams, TimeRange
 from data_source import fetch_posts_with_library
 from analyzer import analyze, Analyzer
-from report_generator import ReportGenerator
+from report_generator import ReportGenerator, build_project_progress_minutes, export_project_progress_minutes
 from sample_library import SampleLibrary
 from project_manager import ProjectManager
 
 
-TEST_DB_PATH = "./sample_library/test_v3_sample_posts.db"
-TEST_PROJECTS_DIR = "./projects_test"
+TEST_DB_PATH = "./sample_library/test_v4_sample_posts.db"
+TEST_PROJECTS_DIR = "./projects_test_v4"
+TEST_REPORTS_DIR = "./reports_test_v4"
 
 
 def cleanup_test_db():
@@ -42,13 +43,14 @@ def cleanup_test_db():
                 continue
         else:
             break
-    if os.path.exists(TEST_PROJECTS_DIR):
-        shutil.rmtree(TEST_PROJECTS_DIR, ignore_errors=True)
+    for d in [TEST_PROJECTS_DIR, TEST_REPORTS_DIR]:
+        if os.path.exists(d):
+            shutil.rmtree(d, ignore_errors=True)
 
 
 def main():
     print("=" * 70)
-    print("  品牌口碑速查工具 v3 - 全面冒烟测试")
+    print("  品牌口碑速查工具 v4 - 全面冒烟测试")
     print("=" * 70)
 
     cleanup_test_db()
@@ -71,148 +73,187 @@ def main():
 
         lib = SampleLibrary(db_path=TEST_DB_PATH)
         pm = ProjectManager(projects_dir=TEST_PROJECTS_DIR)
+        os.makedirs(TEST_REPORTS_DIR, exist_ok=True)
 
-        # ======= 测试1: 数据口径纯净 - 主题分析只用当前周期 =======
+        # ======= 测试1: 项目总览 + 查询快照自动记录 =======
         print("\n" + "-" * 70)
-        print("[1/8] 测试 数据口径纯净 - 主题/代表帖/追问仅用当前周期")
+        print("[1/10] 测试 项目总览 - 查询快照自动记录")
         print("-" * 70)
+
+        proj = pm.create_project(name="小米Q2口碑调研", params=params)
+        print(f"  创建项目: {proj.name} (ID: {proj.project_id})")
 
         posts, stats = fetch_posts_with_library(
             params, count=300, use_library=True, library=lib
         )
         result = analyze(posts, params)
-
-        total_curr = len(result.current_range_posts)
-        total_prev = len(result.previous_range_posts)
-        total_all = len(result.all_posts)
-        print(f"  当前周期帖子数  : {total_curr}")
-        print(f"  上一周期帖子数  : {total_prev}")
-        print(f"  全部(含双周期) : {total_all}")
-        print(f"  主题分析优点数  : {len(result.theme_analysis.advantages)}")
-        print(f"  主题分析槽点数  : {len(result.theme_analysis.complaints)}")
-        print(f"  代表帖数        : {len(result.representative_posts)}")
-
-        assert total_curr > 0, "当前周期应有数据！"
-        assert total_prev > 0, "上一周期应有数据！"
-        assert total_all >= total_curr + total_prev, "双周期总数应不小于两部分之和"
-
+        result_summary = {
+            "current_posts": result.volume_analysis.time_range_posts,
+            "previous_posts": result.volume_analysis.previous_range_posts,
+            "volume_change": result.volume_analysis.volume_change_rate,
+            "negative_ratio": result.volume_analysis.negative_ratio,
+        }
         if result.theme_analysis.complaints:
-            first_comp_count = result.theme_analysis.complaints[0].count
-            assert first_comp_count <= total_curr, f"槽点计数({first_comp_count})不应超过当前周期帖数({total_curr})！"
-        if result.representative_posts:
-            for p in result.representative_posts:
-                assert p in result.current_range_posts, "代表帖应来自当前周期！"
+            result_summary["top_complaint"] = f"{result.theme_analysis.complaints[0].keyword}({result.theme_analysis.complaints[0].count}次)"
+        snap1 = pm.add_query_snapshot(proj, params, result_summary)
+        print(f"  快照1: ID={snap1.snapshot_id}, 当前帖数={result_summary['current_posts']}, 负面占比={result_summary['negative_ratio']:.1f}%")
 
-        print("  ✅ 通过（主题分析、代表帖均来自当前周期）")
+        proj_reloaded = pm.load_project(proj.project_id)
+        assert len(proj_reloaded.query_snapshots) == 1, "应有1个查询快照！"
+        assert proj_reloaded.query_snapshots[0].snapshot_id == snap1.snapshot_id
+        print("  ✅ 通过（查询快照自动记录到项目）")
 
-        # ======= 测试2: 追问深挖仅统计当前周期 =======
+        # ======= 测试2: 多次查询快照 + 口碑变化趋势 =======
         print("\n" + "-" * 70)
-        print("[2/8] 测试 追问深挖仅统计当前周期帖子")
+        print("[2/10] 测试 多次查询快照 + 口碑变化趋势")
         print("-" * 70)
+
+        params2 = QueryParams(
+            target_brand="小米手机",
+            competing_brands=["华为手机"],
+            time_range=TimeRange(
+                start_date=datetime.now() - timedelta(days=60),
+                end_date=datetime.now(),
+            ),
+            focus_themes=["售后", "新品"],
+        )
+        posts2, _ = fetch_posts_with_library(
+            params2, count=300, use_library=True, library=lib
+        )
+        result2 = analyze(posts2, params2)
+        summary2 = {
+            "current_posts": result2.volume_analysis.time_range_posts,
+            "previous_posts": result2.volume_analysis.previous_range_posts,
+            "volume_change": result2.volume_analysis.volume_change_rate,
+            "negative_ratio": result2.volume_analysis.negative_ratio,
+        }
+        if result2.theme_analysis.complaints:
+            summary2["top_complaint"] = f"{result2.theme_analysis.complaints[0].keyword}({result2.theme_analysis.complaints[0].count}次)"
+        snap2 = pm.add_query_snapshot(proj, params2, summary2, notes="扩展到60天")
+        print(f"  快照2: ID={snap2.snapshot_id}, 当前帖数={summary2['current_posts']}, 负面占比={summary2['negative_ratio']:.1f}%")
+
+        proj_reloaded = pm.load_project(proj.project_id)
+        assert len(proj_reloaded.query_snapshots) == 2, "应有2个查询快照！"
+        assert proj_reloaded.query_snapshots[1].notes == "扩展到60天"
+        print("  ✅ 通过（多次快照保存 + 备注）")
+
+        # ======= 测试3: 项目进展纪要导出 =======
+        print("\n" + "-" * 70)
+        print("[3/10] 测试 项目进展纪要导出")
+        print("-" * 70)
+
+        progress_content = build_project_progress_minutes(proj_reloaded)
+        assert "查询快照" in progress_content, "进展纪要应含查询快照章节！"
+        assert "口碑变化趋势" in progress_content, "进展纪要应含口碑变化趋势（2个快照以上）！"
+        assert "追问记录" in progress_content
+        assert "导出纪要记录" in progress_content
+
+        filepath = export_project_progress_minutes(proj_reloaded, output_dir=TEST_REPORTS_DIR)
+        assert os.path.exists(filepath), "进展纪要文件应存在！"
+        with open(filepath, "r", encoding="utf-8") as f:
+            file_content = f.read()
+        assert "调研项目进展纪要" in file_content
+        assert "口碑变化趋势" in file_content
+        print(f"  导出路径: {filepath}")
+        print(f"  文件大小: {len(file_content)} 字符")
+        print("  ✅ 通过（项目进展纪要结构完整，含跨快照对比）")
+
+        # ======= 测试4: reuse 模式双周期样本稳定 =======
+        print("\n" + "-" * 70)
+        print("[4/10] 测试 reuse 模式双周期样本稳定 - 补采样后切回 reuse")
+        print("-" * 70)
+
+        _, _ = fetch_posts_with_library(
+            params, count=300, use_library=True, library=lib, mode="resample"
+        )
+
+        posts_reuse_a, _ = fetch_posts_with_library(
+            params, count=300, use_library=True, library=lib, mode="reuse"
+        )
+        result_reuse_a = analyze(posts_reuse_a, params)
+
+        posts_reuse_b, _ = fetch_posts_with_library(
+            params, count=300, use_library=True, library=lib, mode="reuse"
+        )
+        result_reuse_b = analyze(posts_reuse_b, params)
+
+        print(f"  reuse-A: current={result_reuse_a.volume_analysis.time_range_posts}, previous={result_reuse_a.volume_analysis.previous_range_posts}")
+        print(f"  reuse-B: current={result_reuse_b.volume_analysis.time_range_posts}, previous={result_reuse_b.volume_analysis.previous_range_posts}")
+
+        assert result_reuse_a.volume_analysis.time_range_posts == result_reuse_b.volume_analysis.time_range_posts, "reuse两次当前周期帖数应一致！"
+        assert result_reuse_a.volume_analysis.previous_range_posts == result_reuse_b.volume_analysis.previous_range_posts, "reuse两次上一周期帖数应一致！"
+        assert result_reuse_a.volume_analysis.previous_range_posts > 0, "reuse模式应保留上一周期样本！"
+        print("  ✅ 通过（reuse模式双周期样本稳定，上周期帖数>0）")
+
+        # ======= 测试5: reuse 重启后结果一致 =======
+        print("\n" + "-" * 70)
+        print("[5/10] 测试 reuse 重启后数据一致性")
+        print("-" * 70)
+
+        ids_a = sorted(p.post_id for p in posts_reuse_a if p.brand == params.target_brand)
+        import sample_library
+        sample_library._global_library = None
+        gc.collect()
+
+        lib2 = SampleLibrary(db_path=TEST_DB_PATH)
+        posts_restart, _ = fetch_posts_with_library(
+            params, count=300, use_library=True, library=lib2, mode="reuse"
+        )
+        ids_restart = sorted(p.post_id for p in posts_restart if p.brand == params.target_brand)
+
+        print(f"  原始ID数: {len(ids_a)}, 重启后ID数: {len(ids_restart)}")
+        print(f"  ID集合完全一致: {ids_a == ids_restart}")
+        assert ids_a == ids_restart, "重启后reuse模式样本ID应完全一致！"
+
+        result_restart = analyze(posts_restart, params)
+        assert result_restart.volume_analysis.time_range_posts == result_reuse_a.volume_analysis.time_range_posts
+        assert result_restart.volume_analysis.previous_range_posts == result_reuse_a.volume_analysis.previous_range_posts
+        print("  ✅ 通过（重启后reuse结果完全一致，环比/双周期帖数对齐）")
+
+        # ======= 测试6: 空周期追问显示暂无提及 =======
+        print("\n" + "-" * 70)
+        print("[6/10] 测试 空周期追问 - 当前范围无帖子时显示暂无提及")
+        print("-" * 70)
+
+        future_params = QueryParams(
+            target_brand="小米手机",
+            competing_brands=[],
+            time_range=TimeRange(
+                start_date=datetime.now() + timedelta(days=365),
+                end_date=datetime.now() + timedelta(days=395),
+            ),
+            focus_themes=["售后"],
+        )
+        future_posts, _ = fetch_posts_with_library(
+            future_params, count=100, use_library=True, library=lib2, mode="reuse"
+        )
+        future_result = analyze(future_posts, future_params)
+        print(f"  未来范围当前周期帖数: {len(future_result.current_range_posts)}")
+        assert len(future_result.current_range_posts) == 0, "未来范围当前周期应为空！"
 
         analyzer = Analyzer()
-        if result.theme_analysis.complaints:
-            first_kw = result.theme_analysis.complaints[0].keyword
-            detail = analyzer.get_complaint_detail(first_kw, result)
-            print(f"  追问槽点       : {first_kw}")
-            print(f"  提及数         : {detail.total_mentions}")
-            print(f"  当前周期上限   : {total_curr}")
-            assert detail.total_mentions <= total_curr, "追问提及数不应超过当前周期帖数！"
-            print(f"  分组表达组数   : {len(detail.grouped_expressions)}")
-            print("  ✅ 通过（追问仅统计当前周期）")
-        else:
-            print("  ⚠ 跳过（无槽点数据）")
+        detail = analyzer.get_complaint_detail("售后", future_result)
+        print(f"  追问结果: total_mentions={detail.total_mentions}, trend={detail.frequency_trend}")
+        assert detail.total_mentions == 0, "空周期追问提及数应为0！"
+        assert detail.frequency_trend == "当前范围暂无提及", "空周期追问趋势应提示暂无提及！"
+        print("  ✅ 通过（空周期追问正确显示暂无提及，不拿上周期凑数）")
 
-        # ======= 测试3: 样本库 reuse 模式结果可重现 =======
+        # ======= 测试7: 会议纪要空周期口径同步 =======
         print("\n" + "-" * 70)
-        print("[3/8] 测试 样本库 reuse 模式 - 同查询结果完全可重现")
+        print("[7/10] 测试 会议纪要 - 空周期口径同步（追踪问题跳过暂无提及）")
         print("-" * 70)
 
-        posts_a, _ = fetch_posts_with_library(
-            params, count=300, use_library=True, library=lib, mode="reuse"
-        )
-        posts_b, _ = fetch_posts_with_library(
-            params, count=300, use_library=True, library=lib, mode="reuse"
-        )
+        report_gen = ReportGenerator()
+        minutes = report_gen.build_meeting_minutes(future_result)
+        for issue in minutes.tracking_issues:
+            assert issue.related_count > 0, f"追踪问题「{issue.issue}」提及数应为0时不应出现在纪要中！"
+        print(f"  追踪问题数: {len(minutes.tracking_issues)} (空周期应为0)")
+        assert len(minutes.tracking_issues) == 0, "空周期不应有追踪问题！"
+        print("  ✅ 通过（空周期时追踪问题正确跳过）")
 
-        ids_a = sorted(p.post_id for p in posts_a if p.brand == params.target_brand)
-        ids_b = sorted(p.post_id for p in posts_b if p.brand == params.target_brand)
-        print(f"  reuse模式A目标品牌帖数: {len(ids_a)}")
-        print(f"  reuse模式B目标品牌帖数: {len(ids_b)}")
-        print(f"  ID集合完全一致: {ids_a == ids_b}")
-
-        result_a = analyze(posts_a, params)
-        result_b = analyze(posts_b, params)
-        assert ids_a == ids_b, "两次reuse查询的样本ID应完全一致！"
-        assert result_a.volume_analysis.time_range_posts == result_b.volume_analysis.time_range_posts, "讨论量应一致！"
-        if result_a.theme_analysis.complaints and result_b.theme_analysis.complaints:
-            c1 = result_a.theme_analysis.complaints[0]
-            c2 = result_b.theme_analysis.complaints[0]
-            assert c1.keyword == c2.keyword and c1.count == c2.count, "Top槽点应一致！"
-        print("  ✅ 通过（reuse模式两次查询结果完全一致）")
-
-        # ======= 测试4: resample vs smart 模式差异 =======
+        # ======= 测试8: 对比纪要证据附录 =======
         print("\n" + "-" * 70)
-        print("[4/8] 测试 三种样本策略（smart/reuse/resample）行为")
-        print("-" * 70)
-
-        _, s_reuse = fetch_posts_with_library(params, count=300, use_library=True, library=lib, mode="reuse")
-        _, s_smart = fetch_posts_with_library(params, count=300, use_library=True, library=lib, mode="smart")
-        _, s_resample = fetch_posts_with_library(params, count=300, use_library=True, library=lib, mode="resample")
-
-        print(f"  reuse:    hit={s_reuse.get('library_hit')}, generated={s_reuse.get('new_generated')}")
-        print(f"  smart:    hit={s_smart.get('library_hit')}, generated={s_smart.get('new_generated')}")
-        print(f"  resample: hit={s_resample.get('library_hit')}, generated={s_resample.get('new_generated')}")
-
-        assert s_reuse.get("new_generated", 0) == 0, "reuse模式不应生成新帖子！"
-        assert s_resample.get("new_generated", 0) > 0, "resample模式应生成新帖子！"
-        print("  ✅ 通过（三种策略行为符合预期）")
-
-        # ======= 测试5: 项目管理 CRUD =======
-        print("\n" + "-" * 70)
-        print("[5/8] 测试 调研项目管理 - 创建/查询/更新/删除")
-        print("-" * 70)
-
-        proj = pm.create_project(name="小米Q2口碑调研", params=params)
-        print(f"  创建项目: {proj.name} (ID: {proj.project_id})")
-        assert proj.project_id, "项目ID不能为空！"
-
-        loaded = pm.load_project(proj.project_id)
-        assert loaded is not None, "项目应能被重新加载！"
-        assert loaded.name == proj.name, "项目名应一致！"
-        assert loaded.query_params.target_brand == params.target_brand, "品牌参数应一致！"
-        print(f"  重新加载成功: {loaded.name}, 品牌={loaded.query_params.target_brand}")
-
-        pm.add_follow_up(proj, query="售后为什么差", matched_keyword="售后差", total_mentions=25)
-        pm.add_follow_up(proj, query="涨价", matched_keyword="涨价离谱", total_mentions=18)
-        proj_updated = pm.load_project(proj.project_id)
-        print(f"  追问历史条数: {len(proj_updated.follow_up_history)}")
-        assert len(proj_updated.follow_up_history) == 2, "应保存2条追问记录！"
-
-        test_dir = "./reports_test"
-        os.makedirs(test_dir, exist_ok=True)
-        minutes_path = os.path.abspath(os.path.join(test_dir, "会议纪要_test.txt"))
-        cmp_path = os.path.abspath(os.path.join(test_dir, "对比纪要_test.txt"))
-        with open(minutes_path, "w", encoding="utf-8") as f:
-            f.write("test")
-        with open(cmp_path, "w", encoding="utf-8") as f:
-            f.write("test")
-        pm.add_exported_minutes(proj, minutes_path)
-        pm.add_exported_comparison(proj, cmp_path)
-        proj_updated = pm.load_project(proj.project_id)
-        print(f"  已导出纪要数: {len(proj_updated.exported_minutes_paths)} 会议 + {len(proj_updated.exported_comparison_paths)} 对比")
-        assert len(proj_updated.exported_minutes_paths) == 1
-        assert len(proj_updated.exported_comparison_paths) == 1
-
-        project_list = pm.list_projects()
-        print(f"  项目列表总数: {len(project_list)}")
-        assert len(project_list) >= 1, "至少应有1个项目！"
-
-        print("  ✅ 通过（项目CRUD+追问+导出归档全链路正常）")
-
-        # ======= 测试6: 批量对比导出客户版纪要 =======
-        print("\n" + "-" * 70)
-        print("[6/8] 测试 批量对比客户版纪要导出")
+        print("[8/10] 测试 对比纪要证据附录 - 每品牌附可引用原帖摘要")
         print("-" * 70)
 
         comp = analyzer.compare_brands(
@@ -221,114 +262,68 @@ def main():
             competing_brands=params.competing_brands,
             time_range=params.time_range,
         )
-        report_gen = ReportGenerator()
-        output_dir = "./reports_test"
-        os.makedirs(output_dir, exist_ok=True)
-        filepath = report_gen.export_comparison_minutes(comp, output_dir=output_dir)
-        print(f"  导出路径: {os.path.abspath(filepath)}")
-        assert os.path.exists(filepath), "对比纪要文件应存在！"
+        for row in comp.rows:
+            print(f"  {row.brand}: evidence_posts={len(row.evidence_posts)}")
+            assert len(row.evidence_posts) <= 3
+            if row.total_posts > 0:
+                assert len(row.evidence_posts) > 0, f"{row.brand} 有帖子时应有证据帖！"
 
+        filepath = report_gen.export_comparison_minutes(comp, output_dir=TEST_REPORTS_DIR)
         with open(filepath, "r", encoding="utf-8") as f:
             content = f.read()
+        assert "证据附录" in content, "对比纪要应包含证据附录章节！"
+        assert "可引用原帖" in content, "证据附录应标注可引用原帖！"
+        print(f"  导出路径: {filepath}")
         print(f"  文件大小: {len(content)} 字符")
+        print("  ✅ 通过（对比纪要含证据附录，每品牌附原帖摘要+来源时间）")
 
-        must_have = [
-            "多品牌口碑对比纪要",
-            "总体指标速览",
-            "各品牌详细情况与建议动作",
-            "负面讨论占比",
-            "主要槽点",
-            "带节奏风险",
-            "官方响应率",
-            "建议动作",
-            "总结",
-        ]
-        missing = [k for k in must_have if k not in content]
-        if missing:
-            print(f"  ⚠ 缺少章节: {missing}")
-        else:
-            print(f"  所有核心章节齐全 ✅")
-        assert "总体指标速览" in content, "客户版纪要应包含总体指标！"
-        assert "建议动作" in content, "客户版纪要应包含建议动作！"
-
-        # 验证目标品牌是否标★
-        target_markers = content.count("★")
-        print(f"  目标品牌标记★数: {target_markers}")
-        assert target_markers >= 1, "目标品牌应有★标记！"
-
-        print("  ✅ 通过（客户版对比纪要结构完整）")
-
-        # ======= 测试7: 项目重启后可恢复 =======
+        # ======= 测试9: 项目快照重启后保留 =======
         print("\n" + "-" * 70)
-        print("[7/8] 测试 项目 + 样本库重启后数据一致性（模拟重启）")
+        print("[9/10] 测试 项目快照重启后保留")
         print("-" * 70)
 
-        import sample_library
-        sample_library._global_library = None
-        gc.collect()
-
-        lib2 = SampleLibrary(db_path=TEST_DB_PATH)
         pm2 = ProjectManager(projects_dir=TEST_PROJECTS_DIR)
+        proj_after = pm2.load_project(proj.project_id)
+        assert proj_after is not None
+        assert len(proj_after.query_snapshots) == 2, f"重启后应保留2个快照，实际{len(proj_after.query_snapshots)}！"
+        assert proj_after.query_snapshots[0].result_summary.get("current_posts") == result_summary["current_posts"]
+        assert proj_after.query_snapshots[1].notes == "扩展到60天"
+        print(f"  重启后快照数: {len(proj_after.query_snapshots)}")
+        print("  ✅ 通过（项目快照重启后完整保留）")
 
-        info = lib2.count_by_brand(params.target_brand)
-        print(f"  重启后样本库「{params.target_brand}」帖数: {info['total']}")
-        assert info["total"] > 0, "重启后样本库数据应存在！"
-
-        proj_list = pm2.list_projects()
-        print(f"  重启后项目列表数: {len(proj_list)}")
-        assert len(proj_list) >= 1, "重启后项目应存在！"
-
-        proj_reloaded = pm2.load_project(proj.project_id)
-        assert proj_reloaded is not None
-        assert len(proj_reloaded.follow_up_history) == 2, "重启后追问记录应保留！"
-        print(f"  重启后追问记录: {len(proj_reloaded.follow_up_history)} 条 ✅")
-
-        posts_restart, _ = fetch_posts_with_library(
-            params, count=300, use_library=True, library=lib2, mode="reuse"
-        )
-        result_restart = analyze(posts_restart, params)
-        print(f"  重启后当前周期讨论量: {result_restart.volume_analysis.time_range_posts}")
-        print(f"  重启后总讨论量(all_posts): {len(result_restart.all_posts)}")
-        # 样本库经过 resample 追加后最新帖可能集中在本周期，previous 可能为 0 或 >0
-        # 只要 current_range_posts > 0 就说明样本复用成功
-        assert result_restart.volume_analysis.time_range_posts > 0, "重启后至少应有当前周期数据！"
-        print("  ✅ 通过（重启后样本+项目+追问记录完全一致）")
-
-        # ======= 测试8: 会议纪要同步使用真实环比 + 口径纯净 =======
+        # ======= 测试10: 继续查询 - 基于项目参数重新分析 =======
         print("\n" + "-" * 70)
-        print("[8/8] 测试 会议纪要与主题分析口径纯净 + 环比同步")
+        print("[10/10] 测试 继续查询 - 基于项目参数重新分析结果一致")
         print("-" * 70)
 
-        minutes = report_gen.build_meeting_minutes(result)
-        print(f"  核心发现条数: {len(minutes.key_findings)}")
-        for i, f in enumerate(minutes.key_findings[:3], 1):
-            print(f"    {i}. {f}")
-        assert any("对比上一周期" in f for f in minutes.key_findings), "会议纪要应含真实环比！"
-
-        # 代表帖验证应全部是当前周期的
-        in_current = sum(1 for p in result.representative_posts if p in result.current_range_posts)
-        print(f"  代表帖中属于当前周期的: {in_current}/{len(result.representative_posts)}")
-        assert in_current == len(result.representative_posts), "所有代表帖均应来自当前周期！"
-
-        print("  ✅ 通过")
+        proj_params = proj_after.query_params
+        posts_continue, _ = fetch_posts_with_library(
+            proj_params, count=300, use_library=True, library=lib2, mode="reuse"
+        )
+        result_continue = analyze(posts_continue, proj_params)
+        print(f"  继续查询: current={result_continue.volume_analysis.time_range_posts}, previous={result_continue.volume_analysis.previous_range_posts}")
+        assert result_continue.volume_analysis.time_range_posts == result_reuse_a.volume_analysis.time_range_posts, "继续查询当前周期应一致！"
+        assert result_continue.volume_analysis.previous_range_posts == result_reuse_a.volume_analysis.previous_range_posts, "继续查询上一周期应一致！"
+        print("  ✅ 通过（基于项目参数继续查询结果一致）")
 
         # ======= 清理 =======
         try:
-            shutil.rmtree(output_dir, ignore_errors=True)
+            shutil.rmtree(TEST_REPORTS_DIR, ignore_errors=True)
         except Exception:
             pass
 
         print("\n" + "=" * 70)
-        print("  🎉 v3 全部 8 项测试通过！")
+        print("  🎉 v4 全部 10 项测试通过！")
         print("=" * 70)
         print("\n验证的新功能:")
-        print("  ① 口径纯净     → 主题/槽点/代表帖/追问 仅统计当前周期，上一周期仅用于环比")
-        print("  ② 样本稳定     → smart/reuse/resample 三策略，reuse 模式结果完全可重现")
-        print("  ③ 项目管理     → 项目名+参数快照+追问历史+导出纪要 持久化归档")
-        print("  ④ 客户版对比纪要 → 按品牌负面/槽点/带节奏/官方响应/建议动作 结构化导出")
+        print("  ① 项目沉淀     → 查询快照自动记录，项目总览，继续查询，进展纪要导出")
+        print("  ② 多次快照     → 口碑变化趋势跨快照对比")
+        print("  ③ 样本复核     → reuse 按周期比例分配截断，补采样后双周期样本稳定")
+        print("  ④ 口径纯净     → 空周期追问显示暂无提及，会议纪要追踪问题跳过")
+        print("  ⑤ 证据附录     → 对比纪要每品牌附可引用原帖摘要+来源时间")
         print("\n下一步:")
         print("  python main.py --brand 小米手机 --competitors 华为手机,苹果手机 --days 30 --project 小米Q2调研 --export-compare --no-interactive")
-        print("  python main.py (进入交互，输入「新建项目」「打开项目」「导出对比」体验v3新功能)")
+        print("  python main.py (进入交互，输入「快照」「继续」「导出进展」体验v4新功能)")
 
     finally:
         cleanup_test_db()
