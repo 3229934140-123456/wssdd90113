@@ -1,0 +1,29 @@
+data_sources:
+  - name: 百度贴吧
+    type: tieba
+    enabled: true
+  - name: 知乎话题
+    type: zhihu
+    enabled: true
+  - name: 小红书笔记
+    type: xiaohongshu
+    enabled: true
+  - name: 微博话题
+    type: weibo
+    enabled: true
+  - name: NGA玩家社区
+    type: nga
+    enabled: true
+
+analysis:
+  sentiment_threshold:
+    positive: 0.6
+    negative: 0.4
+  top_n_keywords: 15
+  min_post_length: 10
+  max_summary_length: 80
+
+output:
+  default_dir: ./reports
+  datetime_format: "%Y-%m-%d %H:%M"
+  max_representative_posts: 8
